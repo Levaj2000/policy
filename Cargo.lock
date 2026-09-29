@@ -2705,6 +2705,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-service",
+ "tracing",
  "webpki-roots",
  "yaml_serde",
 ]
@@ -2766,6 +2767,7 @@ dependencies = [
  "cedar-policy",
  "cel",
  "chrono",
+ "criterion",
  "deadpool-redis",
  "futures",
  "getrandom 0.4.3",
@@ -2787,6 +2789,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "yaml_serde",
