@@ -1,45 +1,55 @@
-// Location: ./integrations/cpex-ocsf-audit/examples/emit_sample.rs
-// Copyright 2026 AI Identity
 // SPDX-License-Identifier: Apache-2.0
-//
+// Copyright (c) 2026 Praxis Contributors
+
 // Demo: build two realistic CMF turns (a tool invocation, then an LLM
 // completion), run them through the OCSF audit emitter with attestation
 // chaining on, and pretty-print the resulting OCSF events.
 //
-// Purpose: show what the plugin emits — including every gap field
+// Purpose: show what the plugin emits, including every gap field
 // (stop_reason, mcp, framework, monotonic labels, workload identity)
-// and the tamper-evident hash chain linking the two events — WITHOUT
-// standing up a full CPEX gateway.
+// and the tamper-evident hash chain linking the two events, without
+// standing up a host.
 //
-//   cargo run --example emit_sample
+//   cargo run -p praxis-policy-plugin-ocsf-audit --example emit_sample
 //
 // The timestamps are fixed so the output is deterministic (and so the
 // fingerprint chain is reproducible across runs).
 
+#![allow(
+    missing_docs,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "test and example code"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
 
-use cpex_plugin_ocsf_audit::OcsfAuditEmitter;
+use praxis_policy_plugin_ocsf_audit::OcsfAuditEmitter;
 
-use cpex_plugin_ocsf_audit::host::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
-use cpex_plugin_ocsf_audit::host::extensions::{
+use praxis_policy_core::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
+use praxis_policy_core::extensions::{
     AgentExtension, CompletionExtension, DelegationExtension, DelegationHop, Extensions,
     FrameworkExtension, MCPExtension, SecurityExtension, StopReason, SubjectExtension, TokenUsage,
     ToolMetadata, WorkloadIdentity,
 };
-use cpex_plugin_ocsf_audit::host::plugin::{OnError, PluginConfig, PluginMode};
+use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 
 /// Demo signing key, generated at runtime from a fixed scalar so the
 /// sample output is byte-identical across runs (RFC 6979 deterministic
-/// ECDSA) WITHOUT any key material living in the repo. Demo only — a
-/// real deployment points signing_key_pem_path at a provisioned key and
+/// ECDSA) without any key material living in the repo. Demo only: a
+/// real deployment points `signing_key_pem_path` at a provisioned key and
 /// publishes the public half (JWKS) under the authority named by
-/// authority_uid.
+/// `authority_uid`.
 fn demo_key_pem() -> String {
-    use p256::pkcs8::EncodePrivateKey;
-    p256::ecdsa::SigningKey::from_slice(&[0x42u8; 32])
+    use p256::pkcs8::EncodePrivateKey as _;
+    p256::ecdsa::SigningKey::from_slice(&[0x42_u8; 32])
         .expect("valid P-256 scalar")
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
         .expect("pem")
@@ -69,7 +79,7 @@ fn emitter() -> OcsfAuditEmitter {
     OcsfAuditEmitter::new(config).expect("valid demo config")
 }
 
-/// Turn 1 — an agent invokes the `get_compensation` HR tool. Carries
+/// Turn 1: an agent invokes the `get_compensation` HR tool. Carries
 /// identity, delegation, MCP tool metadata, framework context, taint
 /// labels, and an attested workload identity.
 fn tool_turn() -> (MessagePayload, Extensions) {
@@ -80,7 +90,7 @@ fn tool_turn() -> (MessagePayload, Extensions) {
                 content: ToolCall {
                     tool_call_id: "call-001".into(),
                     name: "get_compensation".into(),
-                    arguments: HashMap::from([("employee_id".to_string(), json!("EMP-001234"))]),
+                    arguments: HashMap::from([("employee_id".to_owned(), json!("EMP-001234"))]),
                     namespace: Some("hr".into()),
                 },
             }],
@@ -155,7 +165,7 @@ fn tool_turn() -> (MessagePayload, Extensions) {
     (payload, ext)
 }
 
-/// Turn 2 — the model produces output. Carries completion metadata:
+/// Turn 2: the model produces output. Carries completion metadata:
 /// stop reason (a gap), token usage, model, latency.
 fn completion_turn() -> (MessagePayload, Extensions) {
     let payload = MessagePayload {
@@ -182,8 +192,8 @@ fn completion_turn() -> (MessagePayload, Extensions) {
     let agent = AgentExtension {
         agent_id: Some("agent-7".into()),
         session_id: Some("sess-42".into()),
-        // Same run as turn 1 — so both events carry
-        // correlation_uid = "conv-9" and are joinable (review C1).
+        // Same run as turn 1, so both events carry
+        // correlation_uid = "conv-9" and are joinable.
         conversation_id: Some("conv-9".into()),
         turn: Some(4),
         ..Default::default()
@@ -222,8 +232,8 @@ fn main() {
         "// chain check: event2.prev_event.fingerprint == event1.fingerprint -> {}",
         fp1 == prev2
     );
-    // And the retrieval coordinates the merged shape adds: prev_event
-    // names the record it points at, so a consumer can go fetch it.
+    // And the retrieval coordinates: prev_event names the record it
+    // points at, so a consumer can go fetch it.
     println!(
         "// chain check: event2.prev_event.uid == event1.metadata.uid   -> {}",
         ev2["attestation_list"][0]["prev_event"]["uid"] == ev1["metadata"]["uid"]
@@ -233,11 +243,11 @@ fn main() {
     // and the public key: reconstruct the signed bytes, recompute the
     // fingerprint, verify the DSSE signature over the PAE.
     {
-        use base64::Engine;
-        use cpex_plugin_ocsf_audit::sign::{dsse_pae, fingerprint_value, signing_input};
-        use p256::ecdsa::signature::Verifier;
+        use base64::Engine as _;
+        use p256::ecdsa::signature::Verifier as _;
+        use praxis_policy_plugin_ocsf_audit::sign::{dsse_pae, fingerprint_value, signing_input};
 
-        let vk = *p256::ecdsa::SigningKey::from_slice(&[0x42u8; 32])
+        let vk = *p256::ecdsa::SigningKey::from_slice(&[0x42_u8; 32])
             .unwrap()
             .verifying_key();
         for (label, ev) in [("event1", &ev1), ("event2", &ev2)] {
