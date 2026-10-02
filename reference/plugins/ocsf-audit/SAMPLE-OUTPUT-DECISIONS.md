@@ -1,56 +1,55 @@
-# Sample output — `cargo run --no-default-features --features ppe --example decision_sink_demo`
+# Sample output: `decision_sink_demo`
 
-Real OCSF decision records produced by the seam consumer in
-[`src/emitter.rs`](src/emitter.rs) (`AuditHandler` / `build_decision`) from the five
-finalized `DecisionLog`s in [`examples/decision_sink_demo.rs`](examples/decision_sink_demo.rs).
-First generated 2026-08-21 against cpex `feat/audit-seam` @ `386710a` (the cpex#166
-audit seam, post-hardening head). Deterministic — timestamps, span ids, and stream
-stamps are fixed, so a re-run reproduces this file byte-for-byte.
+Real OCSF decision records produced by the sink in
+[`src/emitter.rs`](src/emitter.rs) (`AuditHandler` / `build_decision`) from
+the five finalized `DecisionLog`s in
+[`examples/decision_sink_demo.rs`](examples/decision_sink_demo.rs).
+Deterministic: timestamps, span ids and stream stamps are fixed, so a re-run
+reproduces this file byte for byte. AID-EMIT-1 section 12 names this file as
+a conformance vector.
 
-**Regenerated 2026-09-07 on the PPE host** — praxis-proxy/policy PR #84 @ `20798ae`,
-`--no-default-features --features ppe` (see `PRAXIS-PORT-RESULTS.md`) — for
-AID-EMIT-1 1.1.0's optional step `detail`. That is the only host-dependent byte in
-this file: the `cpex` host (the default feature) produces the same output minus the
-two `detail` members below, because the cpex seam records a denying step without
-its violation (only the verdict names one). Everything else — every other member,
-every record, in the same order — is byte-identical across the two hosts. The delta
-in full:
+```sh
+cargo run -p praxis-policy-plugin-ocsf-audit --example decision_sink_demo
+```
+
+A denying step carries the violation that produced it as `detail`:
 
 ```text
-# record 3, step cedar-pdp (denied)            # record 4, step strict-transform (deny_ignored)
+# record 3, step cedar-pdp (denied)            # record 4, step injection-guard (deny_ignored)
 "detail": {                                     "detail": {
   "code": "missing_permission",                   "code": "policy_deny",
   "reason": "no grant covers this tool"           "reason": "blocked"
 },                                              },
 ```
 
-A verifier MUST NOT require `detail` (AID-EMIT-1 §9.2); it is provenance for the
-step's action, and for a suppressed deny the only place the objection's code
-survives.
+A verifier MUST NOT require `detail` (AID-EMIT-1 section 9.2); it is
+provenance for the step's action, and for a suppressed deny the only place the
+objection's code survives, since no verdict names it.
 
 What each record demonstrates:
 
-1. **Allow (clean)** — `action: Allowed` / `disposition: Allowed`; ordered per-plugin
-   steps and the terminal verdict under `unmapped."cpex.decision"`.
-2. **Allow after modification** — `action: Modified`, never re-coded as a plain allow.
-3. **Deny** — `action: Denied` / `disposition: Blocked`, with the executor-stamped
-   violation at `status_code` / `status_detail`. The record a post-hook observer can
-   never produce.
-4. **Suppressed deny + aborted branch** — the flat `deny_ignored: true` flag plus
-   per-step `deny_ignored` / `aborted` actions, so "every suppressed transform deny"
-   is one SIEM query.
-5. **Mandate draw (receipt join key)** — a delegated-authority allow. The JWT-style
-   subject/actor split reads directly off the record: `actor.user` is the subject the
-   work is done *for* (`alice@corp.com`), `ai_agent` is the acting agent (`agent-7`),
-   and the `delegation` object is the explicit edge between them
-   (`origin_subject_uid` → `actor_subject_uid`, per-hop scopes/TTL — a multi-hop
-   chain is the analog of RFC 8693 nested `act` claims). The request id at
-   `unmapped."cmf.request.request_id"` equals the `correlation_id` a signed draw
-   receipt names (`common/biscuit/receipts.py`), so a receipt-in-hand reconciles
-   against this stream.
+1. **Allow (clean).** `action: Allowed` / `disposition: Allowed`; the ordered
+   per-plugin steps and the terminal verdict under `unmapped."cpex.decision"`.
+2. **Allow after modification.** `action: Modified`, never re-coded as a plain
+   allow.
+3. **Deny.** `action: Denied` / `disposition: Blocked`, with the
+   executor-stamped violation at `status_code` / `status_detail`. The record a
+   post-hook observer can never produce.
+4. **Suppressed deny + aborted branch.** The flat `deny_ignored: true` flag
+   plus per-step `deny_ignored` / `aborted` actions, so "every suppressed
+   transform deny" is one SIEM query.
+5. **Mandate draw (receipt join key).** A delegated-authority allow. The
+   subject/actor split reads directly off the record: `actor.user` is the
+   subject the work is done *for* (`alice@corp.com`), `ai_agent` is the acting
+   agent (`agent-7`), and the `delegation` object is the explicit edge between
+   them (`origin_subject_uid` to `actor_subject_uid`, per-hop scopes and TTL;
+   a multi-hop chain is the analog of RFC 8693 nested `act` claims). The
+   request id at `unmapped."cmf.request.request_id"` equals the correlation id
+   a signed draw receipt names, so a receipt-in-hand reconciles against this
+   stream.
 
-Every decision record also carries the invocation span (`unmapped."cpex.span"`) and
-the seam's completeness/ordering stamps (`unmapped."cpex.stream"`:
+Every decision record also carries the invocation span (`unmapped."cpex.span"`)
+and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
 `epoch` / `stream_id` / `stream_seq` / `emission_seq`).
 
 ---

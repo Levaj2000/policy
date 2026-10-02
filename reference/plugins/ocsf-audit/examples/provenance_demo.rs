@@ -1,7 +1,6 @@
-// Location: ./integrations/cpex-ocsf-audit/examples/provenance_demo.rs
-// Copyright 2026 AI Identity
 // SPDX-License-Identifier: Apache-2.0
-//
+// Copyright (c) 2026 Praxis Contributors
+
 // Demo: content provenance digests, the `unmapped."cpex.content"` block
 // AID-EMIT-1 section 9.2 describes. A decision record never carries the
 // payload; it carries two digests of it, one taken at pipeline entry and
@@ -23,35 +22,42 @@
 //                       a confirmation oracle for short or templated
 //                       content.
 //
-//   cargo run --no-default-features --features ppe --example provenance_demo
-//   cargo run --example provenance_demo
+//   cargo run -p praxis-policy-plugin-ocsf-audit --example provenance_demo
 //
-// The digests are the host's. On PPE (praxis-proxy/policy PR #84 2d717e8
-// and later) they are computed by the engine's own `ContentKey`, under
-// keys resolved through the engine's secret store from the two demo
-// values below, exactly the function the executor calls at entry and at
-// emission; this example only feeds it the bytes and places the result on
-// the log the way the executor does. On cpex the seam has no key: every
-// digest is the unkeyed `content_hash` the executor records at entry,
-// which is record 4's form, so the cpex output differs from the PPE
-// output in records 1 to 3 by exactly that.
+// The digests are the engine's. They are computed by its own `ContentKey`,
+// under keys resolved through its secret store from the two demo values
+// below, exactly the function the executor calls at entry and at emission;
+// this example only feeds it the bytes and places the result on the log
+// the way the executor does.
 //
 // Everything a verifier needs to recompute the digests is printed as
 // `// verify` lines: the demo keys, the key-id label, and the canonical
 // audit bytes of each payload. Timestamps, span ids and stream stamps are
 // fixed, so a re-run reproduces the output byte for byte.
 
+#![allow(
+    missing_docs,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "test and example code"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
 
-use cpex_plugin_ocsf_audit::host::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
-use cpex_plugin_ocsf_audit::host::decision::{DecisionLog, PluginAction, Span, Verdict};
-use cpex_plugin_ocsf_audit::host::extensions::{Extensions, SecurityExtension, SubjectExtension};
-use cpex_plugin_ocsf_audit::host::hooks::payload::PluginPayload as _;
-use cpex_plugin_ocsf_audit::host::plugin::{OnError, PluginConfig, PluginMode};
-use cpex_plugin_ocsf_audit::OcsfAuditEmitter;
+use praxis_policy_core::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
+use praxis_policy_core::decision::{DecisionLog, PluginAction, Span, Verdict};
+use praxis_policy_core::extensions::{Extensions, SecurityExtension, SubjectExtension};
+use praxis_policy_core::hooks::payload::{ContentKey, PluginPayload as _};
+use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
+use praxis_policy_core::secrets::{SecretProviderRegistry, SecretStore, SecretsConfig};
+use praxis_policy_plugin_ocsf_audit::OcsfAuditEmitter;
 
 /// The deployment key, as an operator would generate it with
 /// `openssl rand -base64 48`. A demo value: it is printed below so the
@@ -90,9 +96,9 @@ fn sink() -> OcsfAuditEmitter {
 /// The request as it reached the pipeline. `ssn` is the field a redactor
 /// exists to take out; it is a demo value, not a person's.
 fn entry_request(with_ssn: bool) -> MessagePayload {
-    let mut arguments = HashMap::from([("employee_id".to_string(), json!("EMP-001234"))]);
+    let mut arguments = HashMap::from([("employee_id".to_owned(), json!("EMP-001234"))]);
     if with_ssn {
-        arguments.insert("ssn".to_string(), json!("000-00-0000"));
+        arguments.insert("ssn".to_owned(), json!("000-00-0000"));
     }
     MessagePayload {
         message: Message::with_content(
@@ -115,7 +121,7 @@ fn redacted_request() -> MessagePayload {
     if let Some(ContentPart::ToolCall { content }) = payload.message.content.first_mut() {
         content
             .arguments
-            .insert("ssn".to_string(), json!("[REDACTED]"));
+            .insert("ssn".to_owned(), json!("[REDACTED]"));
     }
     payload
 }
@@ -133,7 +139,7 @@ fn subject() -> Extensions {
     }
 }
 
-/// A finalized DecisionLog the way the executor would build it: ordered
+/// A finalized `DecisionLog` the way the executor would build it: ordered
 /// per-plugin steps, a terminal verdict, the invocation span, the stream
 /// stamps, and the two content digests.
 fn finalized(
@@ -153,15 +159,9 @@ fn finalized(
     });
     log.set_stream(1_755_648_000_000_000_000, "gw-1/boot-7".into(), seq, seq);
     log.set_input_hash(input_hash);
-    // PPE records the emission digest on the log too, keyed, so the sink
-    // never hashes. cpex records only the entry digest: the sink computes
-    // the emission one from the final payload at emit time (see
-    // `host::output_hash` in lib.rs), so there is nothing to set here and
-    // the value this example computed is the same one the sink will.
-    #[cfg(feature = "ppe")]
+    // The engine records the emission digest on the log too, so the sink
+    // never hashes and never holds the key.
     log.set_output_hash(output_hash);
-    #[cfg(feature = "cpex")]
-    let _ = output_hash;
     log.finalize(Verdict::Allow);
     log
 }
@@ -173,31 +173,30 @@ struct Scheme {
     digest: Box<dyn Fn(&[u8]) -> Option<String>>,
 }
 
-/// The three schemes on PPE: the deployment key, the rotated key, and the
+/// The three schemes: the deployment key, the rotated key, and the
 /// explicit unkeyed setting. The keys go through the engine's secret
-/// store, `env` backend, the way `engine_settings.content_provenance_key`
+/// store, `file` backend, the way `engine_settings.content_provenance_key`
 /// resolves them at startup, and `ContentKey::keyed` enforces the 32-byte
-/// minimum the engine enforces.
-#[cfg(feature = "ppe")]
+/// minimum the engine enforces. The two key files are written to a
+/// scratch directory for the duration of the resolve and removed after.
 async fn schemes() -> Vec<Scheme> {
-    use cpex_plugin_ocsf_audit::host::hooks::payload::ContentKey;
-    use cpex_plugin_ocsf_audit::host::secrets::{
-        SecretProviderRegistry, SecretStore, SecretsConfig,
-    };
-
-    std::env::set_var("DEMO_PROVENANCE_KEY", DEMO_KEY);
-    std::env::set_var("DEMO_PROVENANCE_KEY_ROTATED", DEMO_KEY_ROTATED);
+    let dir = std::env::temp_dir().join(format!("ocsf-provenance-demo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch directory for the demo keys");
+    std::fs::write(dir.join("provenance_key"), DEMO_KEY).expect("write the demo key");
+    std::fs::write(dir.join("provenance_key_rotated"), DEMO_KEY_ROTATED)
+        .expect("write the rotated demo key");
     let config: SecretsConfig = serde_json::from_value(json!({
-        "providers": { "shell": { "kind": "env" } },
+        "providers": { "local": { "kind": "file", "base_dir": dir } },
         "values": {
-            "provenance_key": { "provider": "shell", "ref": "DEMO_PROVENANCE_KEY" },
-            "provenance_key_rotated": { "provider": "shell", "ref": "DEMO_PROVENANCE_KEY_ROTATED" }
+            "provenance_key": { "provider": "local", "ref": "provenance_key" },
+            "provenance_key_rotated": { "provider": "local", "ref": "provenance_key_rotated" }
         }
     }))
     .expect("a well-formed secrets block");
-    let store = SecretStore::resolve(&config, &SecretProviderRegistry::with_builtin_backends())
-        .await
-        .expect("both demo values resolve from the environment");
+    let resolved =
+        SecretStore::resolve(&config, &SecretProviderRegistry::with_builtin_backends()).await;
+    std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+    let store = resolved.expect("both demo values resolve from the key files");
 
     let keyed = |name: &str| {
         let secret = store.secret(name).expect("declared above");
@@ -221,29 +220,6 @@ async fn schemes() -> Vec<Scheme> {
     ]
 }
 
-/// On cpex there is one scheme: the unkeyed `content_hash` the executor
-/// records at entry. The three slots are kept so the output has the same
-/// shape on both hosts; the names say which one PPE would have used.
-#[cfg(feature = "cpex")]
-async fn schemes() -> Vec<Scheme> {
-    use cpex_plugin_ocsf_audit::host::hooks::payload::content_hash;
-    let unkeyed = || Box::new(|bytes: &[u8]| Some(content_hash(bytes)));
-    vec![
-        Scheme {
-            name: "unkeyed (cpex has no provenance key; PPE: keyed, provenance_key)",
-            digest: unkeyed(),
-        },
-        Scheme {
-            name: "unkeyed (cpex has no provenance key; PPE: keyed, provenance_key_rotated)",
-            digest: unkeyed(),
-        },
-        Scheme {
-            name: "unkeyed",
-            digest: unkeyed(),
-        },
-    ]
-}
-
 /// Sequential steps that all allowed, by plugin name.
 fn allowed(steps: &[&'static str]) -> Vec<(&'static str, PluginMode, PluginAction)> {
     steps
@@ -255,7 +231,7 @@ fn allowed(steps: &[&'static str]) -> Vec<(&'static str, PluginMode, PluginActio
 fn audit_bytes(payload: &MessagePayload) -> Vec<u8> {
     payload
         .audit_bytes()
-        .expect("MessagePayload opts in to audit bytes on both hosts")
+        .expect("MessagePayload opts in to audit bytes")
 }
 
 #[tokio::main(flavor = "current_thread")]
