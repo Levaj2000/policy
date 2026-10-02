@@ -2837,6 +2837,7 @@ dependencies = [
  "praxis-policy-apl-core",
  "praxis-policy-builtins",
  "praxis-policy-core",
+ "serde_json",
  "tokio",
  "yaml_serde",
 ]
