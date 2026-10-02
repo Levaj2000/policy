@@ -231,6 +231,9 @@ fn deny_missing_assertion(
     let mut denied = PipelineResult::denied(violation, extensions, context_table);
     denied.errors = std::mem::take(&mut result.errors);
     denied.metadata = result.metadata.take();
+    // Preserve the pipeline steps that explain this denial. `finish` sets the
+    // verdict after assertions, so the log must carry those steps through.
+    denied.decision_log = std::mem::take(&mut result.decision_log);
     denied
 }
 
@@ -709,6 +712,60 @@ fn warn_on_inactive_settings(cfg: &PolicyConfig) {
     for gap in crate::config::http_routing_gaps(cfg) {
         warn!("{gap}");
     }
+    let settings = &cfg.engine_settings;
+    if !settings.capture_content_provenance && settings.content_provenance_key.is_some() {
+        warn!(
+            "engine_settings.content_provenance_key is set but capture_content_provenance is \
+             off, so nothing is digested"
+        );
+    }
+    if settings.content_key_source() == Some(crate::config::ContentKeySource::Unkeyed) {
+        warn!(
+            alarm = "content_provenance_unkeyed",
+            "content provenance is UNKEYED: every audit record carries a plain SHA-256 of the \
+             payload, and anyone holding a record can test guesses at that payload against it. \
+             A short or templated message carrying a redacted value can be recovered this way. \
+             Name a secret in engine_settings.content_provenance_key outside development"
+        );
+    }
+}
+
+/// The content provenance key a config calls for, from the secrets resolved
+/// so far.
+///
+/// `store` is `None` before the first `initialize`, and a named key then waits
+/// for `initialize` to attach it. After that, secrets are resolved once and
+/// not again on reload, so a key the store does not hold cannot be supplied
+/// and the load is refused rather than left digesting nothing.
+fn content_key_for(
+    cfg: &PolicyConfig,
+    store: Option<&crate::secrets::SecretStore>,
+) -> Result<Option<crate::hooks::payload::ContentKey>, Box<PluginError>> {
+    use crate::config::ContentKeySource;
+    use crate::hooks::payload::ContentKey;
+
+    let name = match cfg.engine_settings.content_key_source() {
+        None => return Ok(None),
+        Some(ContentKeySource::Unkeyed) => return Ok(Some(ContentKey::Unkeyed)),
+        Some(ContentKeySource::Secret(name)) => name,
+    };
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let Some(secret) = store.secret(name) else {
+        return Err(Box::new(PluginError::Config {
+            message: format!(
+                "engine_settings.content_provenance_key names `{name}`, which was not resolved \
+                 when the engine started. Secrets are read once, at startup, so adding or \
+                 renaming one takes a restart"
+            ),
+        }));
+    };
+    ContentKey::keyed(secret).map(Some).map_err(|e| {
+        Box::new(PluginError::Config {
+            message: format!("engine_settings.content_provenance_key `{name}`: {e}"),
+        })
+    })
 }
 
 /// Report what a contract on an `http:` route depends on the host for, and every
@@ -861,11 +918,80 @@ fn register_instances_into(
 /// settings on `policy_config`. Pulls executor timeout / short-circuit and
 /// the route-cache cap from `engine_settings` so both registration paths
 /// agree on field-by-field translation.
-fn snapshot_from_config(registry: PluginRegistry, policy_config: PolicyConfig) -> RuntimeSnapshot {
-    let executor = Executor::new(ExecutorConfig {
+fn snapshot_from_config(
+    registry: PluginRegistry,
+    policy_config: PolicyConfig,
+    prev: Option<&RuntimeSnapshot>,
+    content_key: Option<crate::hooks::payload::ContentKey>,
+) -> RuntimeSnapshot {
+    let mut executor = Executor::new(ExecutorConfig {
         timeout_seconds: policy_config.engine_settings.plugin_timeout,
+        audit_timeout_milliseconds: policy_config.engine_settings.audit_timeout_milliseconds,
         short_circuit_on_deny: policy_config.engine_settings.short_circuit_on_deny,
-    });
+        capture_content_provenance: policy_config.engine_settings.capture_content_provenance,
+        audit_stream_namespace: policy_config.engine_settings.audit_stream_namespace.clone(),
+        audit_epoch: policy_config.engine_settings.audit_epoch,
+    })
+    .with_audit_handlers(registry.audit_handlers());
+    if let Some(key) = content_key {
+        executor = executor.with_content_key(key);
+    }
+
+    if let Some(path) = &policy_config.engine_settings.effect_log_path {
+        // Reuse the running log when a reload leaves the path unchanged. Two
+        // `FileEffectLog` values over one file hold independent append locks,
+        // so an in-flight request still on the old snapshot could append while
+        // the new one compacts, and the rename would drop that record. The
+        // path is the log's identity; a changed compaction threshold on an
+        // unchanged path waits for the next restart.
+        let reused = prev
+            .filter(|p| {
+                p.policy_config
+                    .as_ref()
+                    .and_then(|c| c.engine_settings.effect_log_path.as_ref())
+                    == Some(path)
+            })
+            .and_then(|p| {
+                p.executor
+                    .effect_log()
+                    .map(|log| (log, p.executor.in_flight()))
+            });
+        let log = if let Some((existing, in_flight)) = reused {
+            executor = executor.with_in_flight(in_flight);
+            existing
+        } else {
+            let mut file_log = crate::effect::FileEffectLog::new(path);
+            if let Some(threshold) = policy_config
+                .engine_settings
+                .effect_log_compaction_threshold
+            {
+                file_log = file_log.with_compaction_threshold(threshold);
+            }
+            let built: Arc<dyn crate::effect::DurableEffectLog> = Arc::new(file_log);
+            built
+        };
+        executor = executor.with_effect_log(log);
+    }
+
+    // A reload builds a fresh executor with the stream counters back at zero,
+    // so its epoch has to be strictly larger than the previous generation's.
+    // Otherwise the new `(epoch, seq)` pairs collide with records already
+    // emitted and a consumer can no longer tell a restart from records that
+    // went missing. Boot time always advances; only a pinned `audit_epoch`
+    // override can regress, and that is the host's invariant to keep. Warn
+    // rather than refuse: the records still emit, and only a consumer
+    // asserting completeness would notice.
+    if let Some(prev) = prev {
+        let (was, now) = (prev.executor.epoch(), executor.epoch());
+        if now <= was {
+            warn!(
+                "the audit epoch did not increase across a reload ({was} then {now}); the \
+                 stream counters restart with each executor, so records from this \
+                 generation will collide with the last one's. A programmatic \
+                 `audit_epoch` override has to supply a larger value on every load."
+            );
+        }
+    }
     let route_cache_max_entries = policy_config.engine_settings.route_cache_max_entries;
     let http_routes_declaring_authentication = http_routes_declaring_authentication(&policy_config);
     let declares_assertions = declares_assertions(&policy_config);
@@ -882,6 +1008,17 @@ fn snapshot_from_config(registry: PluginRegistry, policy_config: PolicyConfig) -
         http_routes_declaring_assertions,
         declares_glob_named_routes,
     }
+}
+
+/// Re-derive the executor's audit sinks from the registry.
+///
+/// The sinks are a projection of the registered plugins, so anything that
+/// adds or removes a plugin has to re-run it. A sink left attached after its
+/// plugin is unregistered would keep receiving verdicts, and one registered
+/// after the snapshot was built would silently receive none.
+fn reattach_audit_handlers(snap: &mut RuntimeSnapshot) {
+    let handlers = snap.registry.audit_handlers();
+    snap.executor.set_audit_handlers(handlers);
 }
 
 impl PolicyEngine {
@@ -918,6 +1055,78 @@ impl PolicyEngine {
             secret_providers: std::sync::OnceLock::new(),
             secrets: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the durable log that irreversible effects are recorded to,
+    /// for a host that wires its plugins programmatically rather than from
+    /// config.
+    ///
+    /// The config path (`engine_settings.effect_log_path`) is the usual one.
+    /// This does not survive `load_config`, which rebuilds the executor from
+    /// the config it is given, so a log that must outlive a reload belongs in
+    /// config. Call before [`Self::initialize`] so startup recovery sees it.
+    pub fn set_effect_log(&self, effect_log: Arc<dyn crate::effect::DurableEffectLog>) {
+        self.mutate_runtime(|snap| snap.executor.set_effect_log(effect_log));
+    }
+
+    /// Reconcile any effects a previous run left mid-flight, using the
+    /// default reconciler ([`crate::effect::LogUnknownsReconciler`]).
+    ///
+    /// Completed effects are compacted away and unresolved ones are returned.
+    /// A no-op when no effect log is configured. `initialize` calls this
+    /// already, before any traffic.
+    ///
+    /// Safe to call while serving. Effects this process is still acting on
+    /// are skipped and come back among the unresolved, since an intent whose
+    /// act is running looks the same in the log as one a crash orphaned. See
+    /// [`crate::effect::InFlightEffects`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the effect log cannot be read or rewritten.
+    pub async fn recover_effects(
+        &self,
+    ) -> Result<Vec<crate::effect::EffectRecord>, Box<PluginError>> {
+        self.recover_effects_with(&crate::effect::LogUnknownsReconciler)
+            .await
+    }
+
+    /// Like [`Self::recover_effects`], with a reconciler that can resolve an
+    /// unknown effect by looking up [`crate::effect::EffectRecord::key`] in an
+    /// authoritative ledger.
+    ///
+    /// The reconciler reads the self-describing record, so it is specific to
+    /// the participant at most, never to the plugin that caused the effect.
+    ///
+    /// `reconciler` is never asked about an effect this process is still
+    /// acting on.
+    ///
+    /// Whatever reconciliation settles is emitted to the audit sinks before
+    /// this returns. Without that the answer would be unobservable: the
+    /// resolving record is appended and compacted away inside the same sweep,
+    /// so an effect that spent a restart unaccounted for would quietly vanish
+    /// from the log with nobody told which way it went.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the effect log cannot be read or rewritten.
+    pub async fn recover_effects_with(
+        &self,
+        reconciler: &dyn crate::effect::EffectReconciler,
+    ) -> Result<Vec<crate::effect::EffectRecord>, Box<PluginError>> {
+        let snapshot = self.load_runtime();
+        let Some(log) = snapshot.executor.effect_log() else {
+            return Ok(Vec::new());
+        };
+        let in_flight = snapshot.executor.in_flight();
+        let _sweep = in_flight.sweep();
+        let guarded = crate::effect::SkipInFlight {
+            inner: reconciler,
+            in_flight: &in_flight,
+        };
+        let outcome = log.recover_and_reconcile(&guarded).await?;
+        snapshot.executor.emit_reconciled(outcome.resolved).await;
+        Ok(outcome.unresolved)
     }
 
     /// Load the current runtime snapshot (lock-free, single atomic op).
@@ -1122,6 +1331,13 @@ impl PolicyEngine {
             resolve_factories(&policy_config.plugins, &registry)?
         };
         let instances = create_plugin_instances(&policy_config.plugins, &factories)?;
+        let content_key = if self.initialized.load(Ordering::Acquire) {
+            let empty = crate::secrets::SecretStore::empty();
+            let store = self.secrets.get().map_or(&empty, |s| s.as_ref());
+            content_key_for(&policy_config, Some(store))?
+        } else {
+            content_key_for(&policy_config, None)?
+        };
 
         // Build the new snapshot from the current one — copy-on-write so
         // concurrent invokes keep using the existing config until we swap.
@@ -1137,8 +1353,12 @@ impl PolicyEngine {
         let registered =
             register_instances_into(&mut new_registry, &policy_config.plugins, &instances);
         if registered.is_ok() {
-            self.runtime
-                .store(Arc::new(snapshot_from_config(new_registry, policy_config)));
+            self.runtime.store(Arc::new(snapshot_from_config(
+                new_registry,
+                policy_config,
+                Some(current.as_ref()),
+                content_key,
+            )));
             // Same generation bump as mutate_runtime — load_config doesn't
             // go through that helper because it has to swap registry + executor
             // + cache-cap atomically as one snapshot.
@@ -1413,10 +1633,14 @@ impl PolicyEngine {
         let instances = create_plugin_instances(&policy_config.plugins, &resolved)?;
         let mut new_registry = PluginRegistry::new();
         register_instances_into(&mut new_registry, &policy_config.plugins, &instances)?;
+        let content_key = content_key_for(&policy_config, None)?;
 
-        engine
-            .runtime
-            .store(Arc::new(snapshot_from_config(new_registry, policy_config)));
+        engine.runtime.store(Arc::new(snapshot_from_config(
+            new_registry,
+            policy_config,
+            None,
+            content_key,
+        )));
 
         Ok(engine)
     }
@@ -1461,7 +1685,9 @@ impl PolicyEngine {
         self.try_mutate_runtime(|snap| {
             snap.registry
                 .register::<H>(plugin, config, handler)
-                .map_err(|msg| Box::new(PluginError::Config { message: msg }))
+                .map_err(|msg| Box::new(PluginError::Config { message: msg }))?;
+            reattach_audit_handlers(snap);
+            Ok::<(), Box<PluginError>>(())
         })?;
         self.clear_routing_cache();
         Ok(())
@@ -1501,7 +1727,9 @@ impl PolicyEngine {
         self.try_mutate_runtime(|snap| {
             snap.registry
                 .register_for_names::<H>(plugin, config, handler, names)
-                .map_err(|msg| Box::new(PluginError::Config { message: msg }))
+                .map_err(|msg| Box::new(PluginError::Config { message: msg }))?;
+            reattach_audit_handlers(snap);
+            Ok::<(), Box<PluginError>>(())
         })?;
         self.clear_routing_cache();
         Ok(())
@@ -1526,7 +1754,9 @@ impl PolicyEngine {
         self.try_mutate_runtime(|snap| {
             snap.registry
                 .register::<H>(plugin, config, handler)
-                .map_err(|msg| Box::new(PluginError::Config { message: msg }))
+                .map_err(|msg| Box::new(PluginError::Config { message: msg }))?;
+            reattach_audit_handlers(snap);
+            Ok::<(), Box<PluginError>>(())
         })?;
         self.clear_routing_cache();
         Ok(())
@@ -1646,6 +1876,23 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// Hand the executor the content provenance key, once secrets are read.
+    ///
+    /// The executor is built at `load_config`, before any secret is resolved,
+    /// so a key named in config reaches it here.
+    fn attach_content_key(&self) -> Result<(), Box<PluginError>> {
+        let snapshot = self.load_runtime();
+        let Some(cfg) = snapshot.policy_config.as_ref() else {
+            return Ok(());
+        };
+        let empty = crate::secrets::SecretStore::empty();
+        let store = self.secrets.get().map_or(&empty, |s| s.as_ref());
+        if let Some(key) = content_key_for(cfg, Some(store))? {
+            self.mutate_runtime(|snap| snap.executor.set_content_key(key));
+        }
+        Ok(())
+    }
+
     /// The host services `plugin_name` may borrow, per its capabilities.
     ///
     /// The withheld case is carried rather than dropped so the plugin's
@@ -1700,6 +1947,7 @@ impl PolicyEngine {
         // to already be resolved, and a document whose credentials cannot be
         // read must not reach a request with one of them missing.
         self.resolve_secrets().await?;
+        self.attach_content_key()?;
 
         // Snapshot once at start — subsequent registrations don't affect
         // this initialize() call. They'd need their own initialize.
@@ -1745,6 +1993,24 @@ impl PolicyEngine {
 
                 initialized_plugins.push(plugin_name);
             }
+        }
+
+        // Reconcile whatever a previous run left mid-flight, once, before any
+        // traffic. Without this an orphaned intent sits in the log forever and
+        // the write-ahead record never becomes an answer about what happened.
+        // Best-effort: the append path is independently fail-closed, so a
+        // failure to read the log here is reported rather than fatal, and does
+        // not stop an engine from coming up.
+        match self.recover_effects().await {
+            Ok(unresolved) if !unresolved.is_empty() => {
+                warn!(
+                    "effect log recovery left {} effect(s) unresolved; investigate, or \
+                     install a reconciler that can confirm them by key",
+                    unresolved.len()
+                );
+            },
+            Ok(_) => {},
+            Err(e) => error!("effect log recovery failed at startup: {e}"),
         }
 
         self.initialized.store(true, Ordering::Release);
@@ -1837,16 +2103,18 @@ impl PolicyEngine {
             // plugin on it.
             let matched = resolve_contract_route(&snapshot, &extensions);
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         payload,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
@@ -1858,42 +2126,45 @@ impl PolicyEngine {
             Ok(resolved) => resolved,
             Err(cause) => {
                 return (
-                    self.apply_assertions(
+                    self.finish(
                         &snapshot,
                         Some(hook_name),
                         None,
+                        Some(payload),
                         PipelineResult::denied(
                             cause.violation(),
                             extensions,
                             context_table.unwrap_or_default(),
                         ),
-                    ),
+                    )
+                    .await,
                     BackgroundTasks::empty(),
                 );
             },
         };
-
         if entries.is_empty() {
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         payload,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
 
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     &entries,
                     payload,
                     // Make the host's transport reachable; `filter_extensions`
@@ -1905,7 +2176,14 @@ impl PolicyEngine {
                 .await
         };
         (
-            self.apply_assertions(&snapshot, Some(hook_name), matched.as_ref(), result),
+            self.finish(
+                &snapshot,
+                Some(hook_name),
+                matched.as_ref(),
+                refused,
+                result,
+            )
+            .await,
             tasks,
         )
     }
@@ -1952,16 +2230,18 @@ impl PolicyEngine {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             let matched = resolve_contract_route(&snapshot, &extensions);
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(H::NAME),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
@@ -1973,44 +2253,47 @@ impl PolicyEngine {
             Ok(resolved) => resolved,
             Err(cause) => {
                 return (
-                    self.apply_assertions(
+                    self.finish(
                         &snapshot,
                         Some(H::NAME),
                         None,
+                        Some(Box::new(payload)),
                         PipelineResult::denied(
                             cause.violation(),
                             extensions,
                             context_table.unwrap_or_default(),
                         ),
-                    ),
+                    )
+                    .await,
                     BackgroundTasks::empty(),
                 );
             },
         };
-
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(H::NAME),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
 
         let boxed: Box<dyn PluginPayload> = Box::new(payload);
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     &entries,
                     boxed,
                     // Make the host's transport reachable; `filter_extensions`
@@ -2022,7 +2305,8 @@ impl PolicyEngine {
                 .await
         };
         (
-            self.apply_assertions(&snapshot, Some(H::NAME), matched.as_ref(), result),
+            self.finish(&snapshot, Some(H::NAME), matched.as_ref(), refused, result)
+                .await,
             tasks,
         )
     }
@@ -2079,16 +2363,18 @@ impl PolicyEngine {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             let matched = resolve_contract_route(&snapshot, &extensions);
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
@@ -2100,44 +2386,47 @@ impl PolicyEngine {
             Ok(resolved) => resolved,
             Err(cause) => {
                 return (
-                    self.apply_assertions(
+                    self.finish(
                         &snapshot,
                         Some(hook_name),
                         None,
+                        Some(Box::new(payload)),
                         PipelineResult::denied(
                             cause.violation(),
                             extensions,
                             context_table.unwrap_or_default(),
                         ),
-                    ),
+                    )
+                    .await,
                     BackgroundTasks::empty(),
                 );
             },
         };
-
         if entries.is_empty() {
             let boxed: Box<dyn PluginPayload> = Box::new(payload);
             return (
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
                     Some(hook_name),
                     matched.as_ref(),
+                    None,
                     PipelineResult::allowed_with(
                         boxed,
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
 
         let boxed: Box<dyn PluginPayload> = Box::new(payload);
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     &entries,
                     boxed,
                     // Make the host's transport reachable; `filter_extensions`
@@ -2149,7 +2438,14 @@ impl PolicyEngine {
                 .await
         };
         (
-            self.apply_assertions(&snapshot, Some(hook_name), matched.as_ref(), result),
+            self.finish(
+                &snapshot,
+                Some(hook_name),
+                matched.as_ref(),
+                refused,
+                result,
+            )
+            .await,
             tasks,
         )
     }
@@ -2208,8 +2504,9 @@ impl PolicyEngine {
                 // nested dispatch primitive rather than a wire boundary, and
                 // the contract belongs after policy evaluation, at the outer
                 // boundary this call runs inside.
-                self.apply_assertions(
+                self.finish(
                     &snapshot,
+                    None,
                     None,
                     None,
                     PipelineResult::allowed_with(
@@ -2217,16 +2514,17 @@ impl PolicyEngine {
                         extensions,
                         context_table.unwrap_or_default(),
                     ),
-                ),
+                )
+                .await,
                 BackgroundTasks::empty(),
             );
         }
         let boxed: Box<dyn PluginPayload> = Box::new(payload);
-        let (result, tasks) = {
+        let (result, tasks, refused) = {
             let _boundary = self.enter_executor();
             snapshot
                 .executor
-                .execute(
+                .execute_audited(
                     entries,
                     boxed,
                     // Make the host's transport reachable; `filter_extensions`
@@ -2237,7 +2535,10 @@ impl PolicyEngine {
                 )
                 .await
         };
-        (self.apply_assertions(&snapshot, None, None, result), tasks)
+        (
+            self.finish(&snapshot, None, None, refused, result).await,
+            tasks,
+        )
     }
 
     /// Override the resolved plugin list for one `(entity_type, entity_name)`
@@ -2319,6 +2620,66 @@ impl PolicyEngine {
         });
     }
 
+    /// Settle an invocation: run the assertion contract, then emit one audit
+    /// record carrying the verdict the caller is actually about to receive.
+    ///
+    /// Every return path of every invoke path must pass through here, so each
+    /// invocation emits one record. Emission follows `apply_assertions`, which
+    /// can change an allow to a deny. Route-resolution denials must emit too.
+    ///
+    /// `fallback_payload` is the message for the emit when the result does not
+    /// carry one — a pipeline denial, or a route-resolution denial that never
+    /// reached the pipeline. The payload is put back on an allow, so the
+    /// result a caller sees is unchanged by having been audited.
+    async fn finish(
+        &self,
+        snapshot: &RuntimeSnapshot,
+        hook_name: Option<&str>,
+        matched: Option<&config::MatchedRoute<'_>>,
+        fallback_payload: Option<Box<dyn PluginPayload>>,
+        result: PipelineResult,
+    ) -> PipelineResult {
+        let (mut result, refused) = self.apply_assertions(snapshot, hook_name, matched, result);
+
+        // Taken out so the emit can borrow it while the log inside `result` is
+        // borrowed mutably, then put straight back.
+        let carried = result.modified_payload.take();
+        let verdict = match result.violation.as_ref() {
+            Some(v) => crate::decision::Verdict::Deny(v.clone()),
+            None => crate::decision::Verdict::Allow,
+        };
+        if snapshot.executor.has_audit_handlers()
+            && let Some(payload) = carried
+                .as_deref()
+                .or(refused.as_deref())
+                .or(fallback_payload.as_deref())
+        {
+            // The extensions the pipeline finished with. Sinks are filtered
+            // from these per sink, inside the emit.
+            let extensions = result.modified_extensions.take().unwrap_or_default();
+            // Every pipeline the executor ran comes back with a verdict, so a
+            // log without one is a result the engine built itself: a hook with
+            // no plugins, or a route that denied before the pipeline started.
+            // Nothing captured its entry provenance, and a sink would get a
+            // record with no span or input hash and no arrival taint to diff
+            // the final labels against.
+            if result.decision_log.verdict().is_none() {
+                result.decision_log = snapshot.executor.entry_decisions(payload, &extensions);
+            }
+            snapshot
+                .executor
+                .emit_decision(payload, &extensions, &mut result.decision_log, verdict)
+                .await;
+            result.modified_extensions = Some(extensions);
+        } else {
+            // The result's decision log is part of the caller-visible answer,
+            // even when no sink receives a record or no payload is available.
+            result.decision_log.finalize(verdict);
+        }
+        result.modified_payload = carried;
+        result
+    }
+
     /// Apply the `assertions:` contract in force to a pipeline result.
     ///
     /// Called at **every** return site of every entry point, not only the one
@@ -2333,21 +2694,26 @@ impl PolicyEngine {
     /// belongs after policy evaluation rather than around each step of it.
     /// `matched` is the route the caller already resolved, or `None` where no
     /// route matched, which resolves the global layer alone.
+    ///
+    /// Returns the result alongside the payload a late denial stripped from
+    /// it, if any. A denial carries no payload, but the audit emit still has
+    /// to report the message that was refused, and this is the only path where
+    /// a payload the pipeline allowed is dropped after the fact.
     fn apply_assertions(
         &self,
         snapshot: &RuntimeSnapshot,
         hook_name: Option<&str>,
         matched: Option<&config::MatchedRoute<'_>>,
         mut result: PipelineResult,
-    ) -> PipelineResult {
+    ) -> (PipelineResult, Option<Box<dyn PluginPayload>>) {
         use crate::assertions::Direction;
 
         if !snapshot.declares_assertions {
-            return result;
+            return (result, None);
         }
         let (Some(hook_name), Some(policy_config)) = (hook_name, snapshot.policy_config.as_ref())
         else {
-            return result;
+            return (result, None);
         };
         // The hook's registered phase is the authority, so this feature names no
         // hook: a `Pre` hook asserts toward the upstream, a `Post` hook toward
@@ -2355,7 +2721,7 @@ impl PolicyEngine {
         let Some(direction) = crate::hooks::lookup_hook_metadata(hook_name)
             .and_then(|meta| Direction::from_phase(meta.phase))
         else {
-            return result;
+            return (result, None);
         };
         if let Some(extensions) = result.modified_extensions.as_ref() {
             self.warn_once_if_route_assertions_are_unreachable(
@@ -2368,7 +2734,7 @@ impl PolicyEngine {
         // A denied pipeline forwarded nothing, so there is no upstream response
         // to filter on the way out.
         if denied && direction == Direction::Response {
-            return result;
+            return (result, None);
         }
         // The entity type comes from the request rather than from the matched
         // route, so `global.defaults.http` still governs a generic-HTTP request
@@ -2384,7 +2750,7 @@ impl PolicyEngine {
             entity_type.as_deref(),
             direction,
         ) else {
-            return result;
+            return (result, None);
         };
 
         if denied {
@@ -2395,19 +2761,19 @@ impl PolicyEngine {
             if let Some(extensions) = result.modified_extensions.as_mut() {
                 crate::assertions::apply(&contract, &[], extensions, direction);
             }
-            return result;
+            return (result, None);
         }
 
         let rendered = match result.modified_extensions.as_ref() {
             Some(extensions) => crate::assertions::render(&contract, extensions),
-            None => return result,
+            None => return (result, None),
         };
         match rendered {
             Ok(rendered) => {
                 if let Some(extensions) = result.modified_extensions.as_mut() {
                     crate::assertions::apply(&contract, &rendered, extensions, direction);
                 }
-                result
+                (result, None)
             },
             Err(missing) => {
                 // Strip first. The removal is unconditional, and a refused
@@ -2415,7 +2781,12 @@ impl PolicyEngine {
                 if let Some(extensions) = result.modified_extensions.as_mut() {
                     crate::assertions::apply(&contract, &[], extensions, direction);
                 }
-                deny_missing_assertion(missing, direction, result)
+                // Held back for the emit. `deny_missing_assertion` drops it,
+                // and this is the one denial where the payload reached the
+                // verdict — every other one refused before a payload existed
+                // to report.
+                let refused = result.modified_payload.take();
+                (deny_missing_assertion(missing, direction, result), refused)
             },
         }
     }
@@ -3351,7 +3722,11 @@ impl PolicyEngine {
 
     /// Unregister a plugin by name.
     pub fn unregister(&self, name: &str) -> Option<Arc<PluginRef>> {
-        let removed = self.mutate_runtime(|snap| snap.registry.unregister(name));
+        let removed = self.mutate_runtime(|snap| {
+            let removed = snap.registry.unregister(name);
+            reattach_audit_handlers(snap);
+            removed
+        });
         if removed.is_some() {
             self.clear_routing_cache();
         }
@@ -4705,6 +5080,7 @@ plugins:
                 executor: crate::executor::ExecutorConfig {
                     timeout_seconds: 0,
                     short_circuit_on_deny: true,
+                    ..crate::executor::ExecutorConfig::default()
                 },
                 route_cache_max_entries: DEFAULT_ROUTE_CACHE_MAX_ENTRIES,
             });
@@ -5181,6 +5557,7 @@ plugins:
             executor: crate::executor::ExecutorConfig {
                 timeout_seconds: 30,
                 short_circuit_on_deny: false,
+                ..Default::default()
             },
             route_cache_max_entries: DEFAULT_ROUTE_CACHE_MAX_ENTRIES,
         };
@@ -5348,6 +5725,7 @@ plugins:
             executor: crate::executor::ExecutorConfig {
                 timeout_seconds: 1,
                 short_circuit_on_deny: true,
+                ..Default::default()
             },
             route_cache_max_entries: DEFAULT_ROUTE_CACHE_MAX_ENTRIES,
         };
@@ -6478,6 +6856,96 @@ secrets:
         let msg = format!("{err}");
         assert!(msg.contains("upstream_key"), "{msg}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A secret long enough to key content provenance.
+    const PROVENANCE_KEY: &str = "a-provenance-key-of-thirty-two-bytes-or-more";
+
+    /// The secret fixture with provenance keyed by `upstream_key`.
+    fn provenance_fixture(contents: &str) -> (std::path::PathBuf, String) {
+        let (dir, yaml) = secret_fixture(contents);
+        let yaml = yaml.replace(
+            "  dispatch: hooks\n",
+            "  dispatch: hooks\n  capture_content_provenance: true\n  \
+             content_provenance_key: upstream_key\n",
+        );
+        (dir, yaml)
+    }
+
+    /// The executor is built at load, before any secret is read, so the key
+    /// reaches it at `initialize`.
+    #[tokio::test]
+    async fn initialize_hands_the_executor_its_content_key() {
+        let (dir, yaml) = provenance_fixture(PROVENANCE_KEY);
+        let engine = engine_reading_secrets(&yaml);
+        assert!(engine.load_runtime().executor.provenance_key().is_none());
+
+        engine.initialize().await.expect("initializes");
+
+        assert!(matches!(
+            engine.load_runtime().executor.provenance_key(),
+            Some(crate::hooks::payload::ContentKey::Keyed(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_short_content_key_stops_initialize() {
+        let (dir, yaml) = provenance_fixture("too-short");
+        let engine = engine_reading_secrets(&yaml);
+
+        let err = engine
+            .initialize()
+            .await
+            .expect_err("a weak key is refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("upstream_key") && msg.contains("at least 32"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload rebuilds the executor, and the key comes with it.
+    #[tokio::test]
+    async fn a_reload_keeps_the_content_key() {
+        let (dir, yaml) = provenance_fixture(PROVENANCE_KEY);
+        let engine = engine_reading_secrets(&yaml);
+        engine.initialize().await.expect("initializes");
+
+        engine
+            .load_config(parse_fixture_config(&yaml).unwrap())
+            .expect("the same document reloads");
+
+        assert!(engine.load_runtime().executor.provenance_key().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Secrets are read once, so a reload naming a value nobody resolved has
+    /// no key to give. Refused, rather than digesting nothing with no sign.
+    #[tokio::test]
+    async fn a_reload_naming_an_unresolved_key_is_refused() {
+        let (dir, yaml) = provenance_fixture(PROVENANCE_KEY);
+        let engine = engine_reading_secrets(&yaml);
+        engine.initialize().await.expect("initializes");
+
+        let renamed = yaml
+            .replace("upstream_key", "rotated_key")
+            .replace("upstream.key", "rotated.key");
+        let err = engine
+            .load_config(parse_fixture_config(&renamed).unwrap())
+            .expect_err("the new value was never resolved");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rotated_key") && msg.contains("restart"),
+            "{msg}"
+        );
+        assert!(
+            engine.load_runtime().executor.provenance_key().is_some(),
+            "the running snapshot keeps its key"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9745,6 +10213,460 @@ routes:
             vec!["route".to_owned(), "catch-all".to_owned()],
             "the route answers what it resolves; the reserved name answers the rest"
         );
+    }
+
+    // =====================================================================
+    // Audit sinks
+    // =====================================================================
+    //
+    // The sinks the executor emits to are a projection of the registry, so
+    // anything that adds or removes a plugin has to re-derive them. A sink
+    // left attached after its plugin is gone keeps receiving verdicts; one
+    // registered after the snapshot was built receives none.
+
+    struct SinkPlugin {
+        cfg: PluginConfig,
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for SinkPlugin {
+        fn config(&self) -> &PluginConfig {
+            &self.cfg
+        }
+
+        fn as_audit_handler(self: Arc<Self>) -> Option<Arc<dyn crate::audit::AuditHandler>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl crate::audit::AuditHandler for SinkPlugin {
+        async fn handle(
+            &self,
+            _payload: &dyn PluginPayload,
+            _extensions: &Extensions,
+            _decisions: &crate::decision::DecisionLog,
+        ) {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl HookHandler<TestHook> for SinkPlugin {
+        async fn handle(
+            &self,
+            _payload: &TestPayload,
+            _ext: &Extensions,
+            _ctx: &mut PluginContext,
+        ) -> PluginResult<TestPayload> {
+            PluginResult::allow()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_sink_receives_the_verdict_and_stops_when_unregistered() {
+        let engine = PolicyEngine::default();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cfg = make_config("sink", 10, PluginMode::Sequential);
+        engine
+            .register_handler::<TestHook, _>(
+                Arc::new(SinkPlugin {
+                    cfg: cfg.clone(),
+                    seen: Arc::clone(&seen),
+                }),
+                cfg,
+            )
+            .unwrap();
+
+        let payload = TestPayload {
+            value: "x".to_owned(),
+        };
+        let (_r, _bg) = engine
+            .invoke::<TestHook>(payload.clone(), Extensions::default(), None)
+            .await;
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a sink registered programmatically is attached, not only one from config"
+        );
+
+        engine.unregister("sink");
+        let (_r, _bg) = engine
+            .invoke::<TestHook>(payload, Extensions::default(), None)
+            .await;
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unregistered sink stops receiving verdicts"
+        );
+    }
+
+    // =====================================================================
+    // The effect log, as config wires it
+    // =====================================================================
+
+    fn effect_log_path(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ppe_engine_{tag}_{}_{n}.ndjson",
+            std::process::id()
+        ))
+    }
+
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("recover.tmp"));
+        }
+    }
+
+    /// No `effect_log_path` is the default, and it must leave the engine with
+    /// nothing to recover rather than half-configured.
+    #[tokio::test]
+    async fn without_a_configured_path_there_is_no_effect_log() {
+        let engine = PolicyEngine::default();
+        engine
+            .load_config(PolicyConfig::default())
+            .expect("an empty config loads");
+
+        assert!(engine.recover_effects().await.unwrap().is_empty());
+    }
+
+    /// An intent with no outcome is what a crash mid-mint leaves behind.
+    /// Startup has to find it, or the record never becomes an answer.
+    #[tokio::test]
+    async fn startup_recovery_surfaces_an_effect_left_mid_flight() {
+        let path = effect_log_path("orphan");
+        let _c = RemoveOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"kind":"token_mint","description":"d","key":"k-1","state":"prepared","details":{},"plugin_name":"delegator"}
+"#,
+        )
+        .unwrap();
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config).unwrap();
+
+        let unresolved = engine.recover_effects().await.unwrap();
+
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].key, "k-1");
+        // The default reconciler cannot confirm it, so it stays for an
+        // operator rather than being written off as never having happened.
+        assert_eq!(unresolved[0].state, crate::effect::EffectState::Prepared);
+    }
+
+    /// What reconciliation concluded reaches the audit sinks.
+    ///
+    /// The resolving record is appended and compacted away inside the same
+    /// sweep, so the log is not where anyone reads it: an effect that spent a
+    /// restart unaccounted for used to vanish with nobody told which way it
+    /// went. The emit is the only place that answer surfaces.
+    #[tokio::test]
+    async fn a_reconciled_effect_is_emitted_to_the_sinks() {
+        struct Confirming;
+
+        #[async_trait]
+        impl crate::effect::EffectReconciler for Confirming {
+            async fn reconcile(
+                &self,
+                _effect: &crate::effect::EffectRecord,
+            ) -> crate::effect::EffectState {
+                crate::effect::EffectState::Confirmed
+            }
+        }
+
+        #[derive(Default)]
+        struct EffectSinkPlugin {
+            cfg: PluginConfig,
+            seen: Arc<Mutex<Vec<crate::effect::EffectRecord>>>,
+        }
+
+        #[async_trait]
+        impl Plugin for EffectSinkPlugin {
+            fn config(&self) -> &PluginConfig {
+                &self.cfg
+            }
+
+            fn as_audit_handler(self: Arc<Self>) -> Option<Arc<dyn crate::audit::AuditHandler>> {
+                Some(self)
+            }
+        }
+
+        #[async_trait]
+        impl crate::audit::AuditHandler for EffectSinkPlugin {
+            async fn handle(
+                &self,
+                _payload: &dyn PluginPayload,
+                _extensions: &Extensions,
+                _decisions: &crate::decision::DecisionLog,
+            ) {
+            }
+
+            async fn on_effect(
+                &self,
+                effect: &crate::effect::EffectRecord,
+                _extensions: &Extensions,
+            ) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(effect.clone());
+            }
+        }
+
+        impl HookHandler<TestHook> for EffectSinkPlugin {
+            async fn handle(
+                &self,
+                _payload: &TestPayload,
+                _ext: &Extensions,
+                _ctx: &mut PluginContext,
+            ) -> PluginResult<TestPayload> {
+                PluginResult::allow()
+            }
+        }
+
+        let path = effect_log_path("reconciled_emit");
+        let _c = RemoveOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"kind":"token_mint","description":"d","key":"k-1","state":"prepared","details":{},"plugin_name":"delegator"}
+"#,
+        )
+        .unwrap();
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let cfg = make_config("effect-sink", 10, PluginMode::Sequential);
+        engine
+            .register_handler::<TestHook, _>(
+                Arc::new(EffectSinkPlugin {
+                    cfg: cfg.clone(),
+                    seen: Arc::clone(&seen),
+                }),
+                cfg,
+            )
+            .unwrap();
+
+        let unresolved = engine.recover_effects_with(&Confirming).await.unwrap();
+
+        assert!(unresolved.is_empty(), "the reconciler answered");
+        let seen = std::mem::take(
+            &mut *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        assert_eq!(seen.len(), 1, "and the sink was told: {seen:?}");
+        assert_eq!(seen[0].key, "k-1");
+        assert_eq!(seen[0].state, crate::effect::EffectState::Confirmed);
+        assert!(
+            seen[0].stream_seq.is_some(),
+            "stamped into this process's stream, not the one that crashed"
+        );
+        assert!(
+            crate::effect::FileEffectLog::new(&path)
+                .recover()
+                .await
+                .unwrap()
+                .unresolved
+                .is_empty(),
+            "and the pair is compacted out of the log"
+        );
+    }
+
+    /// A sweep during traffic leaves a mint that is still running alone.
+    ///
+    /// The regression: the sweep read the running mint's intent, a ledger
+    /// that had not seen it yet answered `Rejected`, and the plugin then
+    /// recorded `Confirmed` for the same key. Two answers for one act.
+    #[tokio::test]
+    async fn a_sweep_leaves_a_running_effect_alone() {
+        struct Rejecting;
+
+        #[async_trait]
+        impl crate::effect::EffectReconciler for Rejecting {
+            async fn reconcile(
+                &self,
+                _effect: &crate::effect::EffectRecord,
+            ) -> crate::effect::EffectState {
+                crate::effect::EffectState::Rejected
+            }
+        }
+
+        /// Records its intent, then holds the act open until released.
+        struct PausedMint {
+            cfg: PluginConfig,
+            began: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl Plugin for PausedMint {
+            fn config(&self) -> &PluginConfig {
+                &self.cfg
+            }
+        }
+
+        impl HookHandler<TestHook> for PausedMint {
+            async fn handle(
+                &self,
+                _payload: &TestPayload,
+                ext: &Extensions,
+                _ctx: &mut PluginContext,
+            ) -> PluginResult<TestPayload> {
+                let effect = crate::effect::EffectRecord::prepared("token_mint", "d", "live-key");
+                let outcome: Result<(), Box<PluginError>> = ext
+                    .perform_effect(&effect, || async {
+                        self.began.notify_one();
+                        self.release.notified().await;
+                        Ok(())
+                    })
+                    .await;
+                outcome.unwrap();
+                PluginResult::allow()
+            }
+        }
+
+        let path = effect_log_path("live_sweep");
+        let _c = RemoveOnDrop(path.clone());
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = Arc::new(PolicyEngine::default());
+        engine.load_config(config).unwrap();
+
+        let began = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cfg = make_config("minter", 10, PluginMode::Sequential);
+        engine
+            .register_handler::<TestHook, _>(
+                Arc::new(PausedMint {
+                    cfg: cfg.clone(),
+                    began: Arc::clone(&began),
+                    release: Arc::clone(&release),
+                }),
+                cfg,
+            )
+            .unwrap();
+        engine.initialize().await.unwrap();
+
+        let invoking = Arc::clone(&engine);
+        let request = tokio::spawn(async move {
+            invoking
+                .invoke::<TestHook>(
+                    TestPayload { value: "x".into() },
+                    Extensions::default(),
+                    None,
+                )
+                .await
+        });
+        began.notified().await;
+
+        let unresolved = engine.recover_effects_with(&Rejecting).await.unwrap();
+        assert_eq!(
+            unresolved
+                .iter()
+                .map(|r| r.key.as_str())
+                .collect::<Vec<_>>(),
+            ["live-key"],
+            "the running mint is left for later, not answered"
+        );
+
+        release.notify_one();
+        let (result, _) = request.await.unwrap();
+        assert!(result.continue_processing);
+
+        let states: Vec<_> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<crate::effect::EffectRecord>(l)
+                    .unwrap()
+                    .state
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                crate::effect::EffectState::Prepared,
+                crate::effect::EffectState::Confirmed
+            ],
+            "one answer, from the plugin that acted"
+        );
+    }
+
+    /// A completed effect is not something to reconcile, so recovery drops it.
+    #[tokio::test]
+    async fn startup_recovery_compacts_a_completed_effect() {
+        let path = effect_log_path("done");
+        let _c = RemoveOnDrop(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"kind":"token_mint","description":"d","key":"k-1","state":"prepared","details":{},"plugin_name":null}
+{"kind":"token_mint","description":"d","key":"k-1","state":"confirmed","details":{},"plugin_name":null}
+"#,
+        )
+        .unwrap();
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config).unwrap();
+
+        assert!(engine.recover_effects().await.unwrap().is_empty());
+    }
+
+    /// Two `FileEffectLog` values over one file hold independent append locks,
+    /// so a reload that rebuilt the log could let an in-flight request append
+    /// while the new one compacts, and the rename would drop that record.
+    #[tokio::test]
+    async fn a_reload_on_an_unchanged_path_keeps_the_running_log() {
+        let path = effect_log_path("reload");
+        let _c = RemoveOnDrop(path.clone());
+
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(path.display().to_string());
+        let engine = PolicyEngine::default();
+        engine.load_config(config.clone()).unwrap();
+        let before = engine.load_runtime().executor.effect_log().unwrap();
+
+        engine.load_config(config).unwrap();
+        let after = engine.load_runtime().executor.effect_log().unwrap();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the same path must keep the same log instance across a reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_onto_a_different_path_builds_a_new_log() {
+        let first = effect_log_path("path_a");
+        let second = effect_log_path("path_b");
+        let _a = RemoveOnDrop(first.clone());
+        let _b = RemoveOnDrop(second.clone());
+
+        let engine = PolicyEngine::default();
+        let mut config = PolicyConfig::default();
+        config.engine_settings.effect_log_path = Some(first.display().to_string());
+        engine.load_config(config).unwrap();
+        let before = engine.load_runtime().executor.effect_log().unwrap();
+
+        let mut moved = PolicyConfig::default();
+        moved.engine_settings.effect_log_path = Some(second.display().to_string());
+        engine.load_config(moved).unwrap();
+        let after = engine.load_runtime().executor.effect_log().unwrap();
+
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 }
 

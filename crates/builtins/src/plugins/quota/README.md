@@ -202,15 +202,16 @@ refused port, so under `on_error: allow` those misconfigurations serve
 unmetered. Keep `deny` unless an outage should pass traffic, and alert on the
 rate of the `on_error` warning.
 
-The debit path (`cmf.llm_output`) never denies, and it runs off the response
-path: the `/report` call is dispatched asynchronously so a slow Limitador does
-not add its round trip to the response tail. A failed debit is recorded as a
+The debit path (`cmf.llm_output`) does not deny on a backend failure. It waits
+for `/report` before returning, so a slow Limitador adds up to
+`timeout_seconds` to the response tail. The executor's plugin timeout still
+applies to this hook and uses its configured `on_error` posture. The host
+transport is scoped to this invocation and is not retained by a background
+task. A failed or cancelled debit is recorded as a
 per-principal pending debit and re-reported by the next admission, which is
 denied (`quota.unsettled_debit`) until it lands. The pending state is per
-replica and in process: a restart loses it. On shutdown the plugin drains
-in-flight debits, bounded by `timeout_seconds`, so a clean restart lets them
-land or record; a debit still in flight when that bound elapses, or when the
-process dies, is lost.
+replica and in process: a restart loses it. A process crash during `/report`
+can still leave an ambiguous debit that this replica cannot recover.
 
 Neither call retries: `/report` increments unconditionally, so a repeat would
 double-charge, and `/check` skips retry to keep tail latency off the admission

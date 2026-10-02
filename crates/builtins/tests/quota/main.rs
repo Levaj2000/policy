@@ -11,7 +11,6 @@
 
 #![expect(
     clippy::expect_used,
-    clippy::panic,
     reason = "integration tests assert quota outcomes"
 )]
 
@@ -26,7 +25,7 @@ use praxis_policy_core::hooks::HookHandler as _;
 use praxis_policy_core::host::HttpTransportSlot;
 use praxis_policy_core::http::{HttpRequest, HttpResponse, HttpTransport, HttpTransportError};
 use praxis_policy_core::http_testing::FakeTransport;
-use praxis_policy_core::plugin::{Plugin as _, PluginConfig};
+use praxis_policy_core::plugin::PluginConfig;
 use praxis_policy_core::prelude::PluginContext;
 use serde_json::json;
 
@@ -97,20 +96,6 @@ fn output_payload(body: &str) -> MessagePayload {
     MessagePayload {
         message: Message::text(Role::Assistant, body),
     }
-}
-
-/// Poll `cond` until it holds, yielding so the spawned debit task can run. The
-/// post-invoke debit is fire-and-forget, so a test asserting on its /report
-/// call waits for it rather than racing it. Panics if it never holds, so a real
-/// regression fails instead of hanging.
-async fn eventually(mut cond: impl FnMut() -> bool) {
-    for _ in 0..500 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
-    panic!("condition never became true");
 }
 
 #[tokio::test]
@@ -267,7 +252,7 @@ async fn report_debits_the_fallback_when_typed_usage_absent() {
         )
         .await;
     assert!(!result.is_denied(), "an absent total must never deny");
-    eventually(|| t.call_count_for("/report") == 1).await;
+    assert_eq!(t.call_count_for("/report"), 1);
     let sent =
         String::from_utf8_lossy(&t.last_request().expect("a fallback debit").body).into_owned();
     assert!(sent.contains(r#""delta":1000"#), "{sent}");
@@ -285,7 +270,7 @@ async fn report_debits_the_fallback_when_typed_usage_is_zero() {
         )
         .await;
     assert!(!result.is_denied());
-    eventually(|| t.call_count_for("/report") == 1).await;
+    assert_eq!(t.call_count_for("/report"), 1);
     let sent =
         String::from_utf8_lossy(&t.last_request().expect("a fallback debit").body).into_owned();
     assert!(sent.contains(r#""delta":1000"#), "{sent}");
@@ -324,8 +309,7 @@ async fn a_failed_debit_denies_until_it_settles() {
         )
         .await;
     assert!(!out.is_denied(), "the report hook never denies");
-    // The debit is spawned; wait for the failed /report to land and be recorded.
-    eventually(|| t_fail.call_count_for("/report") == 1).await;
+    assert_eq!(t_fail.call_count_for("/report"), 1);
 
     // Next admission: the flush still fails, so deny (fail-closed) without even
     // running the check probe.
@@ -393,8 +377,7 @@ async fn a_cancelled_flush_does_not_wedge_the_principal() {
         )
         .await;
     assert!(!out.is_denied());
-    // The debit is spawned; wait for the failed /report to land and be recorded.
-    eventually(|| t_fail.call_count_for("/report") == 1).await;
+    assert_eq!(t_fail.call_count_for("/report"), 1);
 
     // Start a flush whose report hangs, then cancel it by dropping the future.
     let check = QuotaCheck::new(Arc::clone(&core));
@@ -448,7 +431,7 @@ async fn report_debits_the_typed_completion_usage() {
         )
         .await;
     assert!(!result.is_denied());
-    eventually(|| t.call_count_for("/report") == 1).await;
+    assert_eq!(t.call_count_for("/report"), 1);
     let sent = String::from_utf8_lossy(&t.last_request().expect("a debit").body).into_owned();
     assert!(sent.contains(r#""delta":25"#), "{sent}");
     assert!(sent.contains(r#""sub":"alice""#), "{sent}");
@@ -469,7 +452,7 @@ async fn report_ignores_the_response_body_and_uses_typed_usage() {
         )
         .await;
     assert!(!result.is_denied());
-    eventually(|| t.call_count_for("/report") == 1).await;
+    assert_eq!(t.call_count_for("/report"), 1);
     let sent = String::from_utf8_lossy(&t.last_request().expect("a debit").body).into_owned();
     assert!(sent.contains(r#""delta":25"#), "{sent}");
 }
@@ -638,8 +621,7 @@ impl CountingLimitador {
         self
     }
 
-    /// How many /report calls have landed, so a test can wait for the spawned
-    /// debit before the next check reads the counter.
+    /// How many /report calls have landed.
     fn reports_seen(&self) -> u64 {
         self.reports.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -709,8 +691,7 @@ async fn a_principal_is_denied_once_cumulative_debits_reach_the_budget() {
             )
             .await;
         assert!(!debit.is_denied(), "the report hook never denies");
-        // The debit is spawned; the counter must catch up before the next check.
-        eventually(|| lim.reports_seen() == round + 1).await;
+        assert_eq!(lim.reports_seen(), round + 1);
     }
 
     let denied = check
@@ -726,13 +707,12 @@ async fn a_principal_is_denied_once_cumulative_debits_reach_the_budget() {
 }
 
 #[tokio::test]
-async fn shutdown_drains_an_in_flight_debit_so_it_lands() {
-    // A debit still in flight at shutdown must land, not be dropped with the
-    // task. shutdown returns only after the slow /report has been counted.
+async fn report_waits_for_a_slow_debit_before_returning() {
+    // The transport grant belongs to this invocation. The slow /report must
+    // land before the handler returns.
     let lim =
         Arc::new(CountingLimitador::new(100).with_latency(std::time::Duration::from_millis(100)));
-    let core = core("deny");
-    let out = QuotaReport::new(Arc::clone(&core))
+    let out = QuotaReport::new(core("deny"))
         .handle(
             &output_payload("done"),
             &ext_with_sub_and_usage("bob", 40, lim.clone()),
@@ -740,20 +720,13 @@ async fn shutdown_drains_an_in_flight_debit_so_it_lands() {
         )
         .await;
     assert!(!out.is_denied());
-    assert_eq!(lim.reports_seen(), 0, "the debit is still in flight");
-
-    core.shutdown().await.expect("shutdown succeeds");
-    assert_eq!(
-        lim.reports_seen(),
-        1,
-        "shutdown must drain the in-flight debit"
-    );
+    assert_eq!(lim.reports_seen(), 1, "the debit landed before return");
 }
 
 #[tokio::test]
-async fn shutdown_drains_a_failing_debit_so_it_is_recorded_pending() {
-    // A debit that fails while shutdown drains it must still be recorded as
-    // pending, so the principal is denied until it settles.
+async fn report_records_a_failed_debit_before_returning() {
+    // A failed /report is recorded as pending before the handler returns, so
+    // the next admission denies until it settles.
     let core = core("deny");
     let t_fail = Arc::new(
         FakeTransport::new()
@@ -768,8 +741,6 @@ async fn shutdown_drains_a_failing_debit_so_it_is_recorded_pending() {
         )
         .await;
     assert!(!out.is_denied());
-
-    core.shutdown().await.expect("shutdown succeeds");
 
     let t_still = Arc::new(
         FakeTransport::new()
@@ -791,4 +762,42 @@ async fn shutdown_drains_a_failing_debit_so_it_is_recorded_pending() {
         denied.violation.expect("a denial carries a violation").code,
         "quota.unsettled_debit"
     );
+}
+
+#[tokio::test]
+async fn a_cancelled_report_keeps_its_debit_pending() {
+    let core = core("deny");
+    let slow = Arc::new(
+        FakeTransport::new()
+            .with_latency(std::time::Duration::from_secs(30))
+            .json("/report", 200, ""),
+    );
+    let report = QuotaReport::new(Arc::clone(&core));
+    let ext = ext_with_sub_and_usage("bob", 11, as_transport(&slow));
+    let mut ctx = PluginContext::new();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        report.handle(&output_payload("done"), &ext, &mut ctx),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the report was cancelled mid-request");
+
+    let still_failing = Arc::new(
+        FakeTransport::new()
+            .json("/report", 500, "")
+            .json("/check", 200, ""),
+    );
+    let denied = QuotaCheck::new(core)
+        .handle(
+            &input_payload(),
+            &ext_with_sub("bob", as_transport(&still_failing)),
+            &mut PluginContext::new(),
+        )
+        .await;
+    assert!(denied.is_denied());
+    assert_eq!(
+        denied.violation.expect("a denial carries a violation").code,
+        "quota.unsettled_debit"
+    );
+    assert_eq!(still_failing.call_count_for("/check"), 0);
 }

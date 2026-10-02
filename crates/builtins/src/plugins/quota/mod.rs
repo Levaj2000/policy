@@ -23,8 +23,9 @@
 //! the gateway to aggregate streamed usage into the typed completion usage.
 //! `identity_claim` must name a verified subject id.
 //!
-//! Fail-closed reconciliation: the post-invoke `/report` is dispatched off the
-//! response path, so a slow Limitador does not hold the response. A failed
+//! Fail-closed reconciliation: the post-invoke `/report` finishes before the
+//! handler returns, using only its invocation-scoped host transport. A slow
+//! Limitador can extend the response tail up to the configured timeout. A failed
 //! `/report` is recorded per principal and re-reported on the next admission,
 //! which is denied until it lands. Limitador
 //! `/report` is not idempotent, so a retry after an ambiguous loss may over-charge

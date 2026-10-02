@@ -13,8 +13,6 @@ use praxis_policy_core::error::{PluginError, PluginViolation};
 use praxis_policy_core::hooks::{Extensions, HookHandler, PluginResult};
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 use praxis_policy_core::prelude::PluginContext;
-use tokio_util::task::TaskTracker;
-use tracing::Instrument as _;
 
 use super::backend::{BackendErrorKind, CheckOutcome, QuotaBackend};
 use super::client::LimitadorClient;
@@ -39,9 +37,6 @@ pub const CODE_QUOTA_NO_IDENTITY: &str = "quota.no_identity";
 /// Limitador. The next admission re-reports it; a retry clears it once it lands.
 pub const CODE_QUOTA_UNSETTLED_DEBIT: &str = "quota.unsettled_debit";
 
-/// Slack past `timeout_seconds` for the shutdown drain of in-flight debits.
-const DRAIN_SLACK: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// HTTP 429, set as the violation's `proto_error_code` for an over-budget denial.
 const HTTP_TOO_MANY_REQUESTS: i64 = 429;
 
@@ -56,6 +51,9 @@ struct PendingDebit {
     /// accumulated delta (a deterministic double-charge, distinct from the
     /// unavoidable ambiguous-loss one).
     flushing: bool,
+    /// Reports still using an invocation's host transport. Admission waits
+    /// rather than flushing a debit that may already be landing.
+    active_reports: usize,
 }
 
 /// Whether a pending-debit flush leaves admission able to proceed.
@@ -90,6 +88,41 @@ impl Drop for FlushClaim<'_> {
     }
 }
 
+/// A report in progress. Cancellation leaves its amount pending because the
+/// request may have reached Limitador even when its answer was lost.
+struct DebitClaim<'a> {
+    pending: &'a Mutex<HashMap<String, PendingDebit>>,
+    principal: &'a str,
+    delta: u64,
+    settled: bool,
+}
+
+impl DebitClaim<'_> {
+    fn finish(&mut self, confirmed: bool) {
+        let mut map = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let p = map.entry(self.principal.to_owned()).or_default();
+        p.active_reports = p.active_reports.saturating_sub(1);
+        if !confirmed {
+            p.delta = p.delta.saturating_add(self.delta);
+        }
+        if p.delta == 0 && !p.flushing && p.active_reports == 0 {
+            map.remove(self.principal);
+        }
+        self.settled = true;
+    }
+}
+
+impl Drop for DebitClaim<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.finish(false);
+        }
+    }
+}
+
 /// Shared runtime state for both handlers: the parsed config, the quota
 /// backend (a trait object), the declared `PluginConfig`, and the per-principal
 /// pending debits a failed `/report` accumulates for the next admission to flush.
@@ -99,9 +132,6 @@ pub struct Quota {
     typed: QuotaConfig,
     backend: Box<dyn QuotaBackend>,
     pending: Mutex<HashMap<String, PendingDebit>>,
-    /// Tracks in-flight debits so `shutdown` can drain them instead of
-    /// dropping them mid-flight on a restart.
-    debits: TaskTracker,
 }
 
 impl Quota {
@@ -149,7 +179,6 @@ impl Quota {
             typed,
             backend,
             pending: Mutex::new(HashMap::new()),
-            debits: TaskTracker::new(),
         })
     }
 
@@ -160,7 +189,8 @@ impl Quota {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Record a debit that failed to land, for the next admission to re-report.
+    /// Seed a failed debit for unit tests of concurrent flushing.
+    #[cfg(test)]
     fn record_failed_debit(&self, principal: &str, delta: u64) {
         let mut map = self.pending();
         let entry = map.entry(principal.to_owned()).or_default();
@@ -168,21 +198,31 @@ impl Quota {
     }
 
     /// Report `total` tokens for `principal`, recording a pending debit on
-    /// failure for the next admission to re-report. Spawned off the response
-    /// path by the post-invoke handler, so a slow `/report` never adds its
-    /// round trip to the response tail.
+    /// failure for the next admission to re-report. This completes while the
+    /// invocation-scoped host transport is available to the post-invoke handler.
     async fn debit(&self, ext: &Extensions, principal: &str, total: u64) {
-        if let Err(e) = self
+        {
+            let mut map = self.pending();
+            let entry = map.entry(principal.to_owned()).or_default();
+            entry.active_reports = entry.active_reports.saturating_add(1);
+        }
+        let mut claim = DebitClaim {
+            pending: &self.pending,
+            principal,
+            delta: total,
+            settled: false,
+        };
+        let result = self
             .backend
             .report(ext, &self.typed.identity_claim, principal, total)
-            .await
-        {
+            .await;
+        claim.finish(result.is_ok());
+        if let Err(e) = result {
             tracing::warn!(
                 error = %e,
                 delta = total,
                 "quota: token debit failed; recorded for retry, principal denied until it settles"
             );
-            self.record_failed_debit(principal, total);
         }
     }
 
@@ -193,8 +233,8 @@ impl Quota {
             let mut map = self.pending();
             match map.get_mut(principal) {
                 None => return FlushOutcome::Proceed,
+                Some(p) if p.flushing || p.active_reports != 0 => return FlushOutcome::Deny,
                 Some(p) if p.delta == 0 => return FlushOutcome::Proceed,
-                Some(p) if p.flushing => return FlushOutcome::Deny,
                 Some(p) => {
                     p.flushing = true;
                     p.delta
@@ -219,7 +259,7 @@ impl Quota {
                 match result {
                     Ok(()) => {
                         p.delta = p.delta.saturating_sub(attempted);
-                        if p.delta == 0 {
+                        if p.delta == 0 && p.active_reports == 0 {
                             FlushOutcome::Proceed
                         } else {
                             // Another debit failed while this report was in
@@ -237,7 +277,7 @@ impl Quota {
         };
         if map
             .get(principal)
-            .is_some_and(|p| p.delta == 0 && !p.flushing)
+            .is_some_and(|p| p.delta == 0 && !p.flushing && p.active_reports == 0)
         {
             map.remove(principal);
         }
@@ -249,24 +289,6 @@ impl Quota {
 impl Plugin for Quota {
     fn config(&self) -> &PluginConfig {
         &self.cfg
-    }
-
-    /// Drain in-flight debits so a shutdown or rolling restart lets them land
-    /// (or record as pending) instead of dropping them. Bounded: each debit is
-    /// one call capped at `timeout_seconds`, and they run concurrently.
-    async fn shutdown(&self) -> Result<(), Box<PluginError>> {
-        self.debits.close();
-        let bound = self.typed.timeout() + DRAIN_SLACK;
-        if tokio::time::timeout(bound, self.debits.wait())
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                in_flight = self.debits.len(),
-                "quota: shutdown drain timed out; in-flight token debits dropped"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -391,7 +413,8 @@ impl HookHandler<CmfHook> for QuotaCheck {
 }
 
 /// Post-invoke handler on `cmf.llm_output`. Debits the gateway's typed token
-/// usage, or a conservative fallback when it is absent. Never denies.
+/// usage, or a conservative fallback when it is absent. Backend failures do
+/// not deny; the executor's plugin timeout still applies.
 #[derive(Debug)]
 pub struct QuotaReport {
     core: Arc<Quota>,
@@ -437,24 +460,11 @@ impl HookHandler<CmfHook> for QuotaReport {
             .filter(|total| *total > 0)
             .unwrap_or(self.core.typed.missing_usage_charge);
 
-        // Debit off the response path so a slow /report does not hold the
-        // response. The response is released before the debit lands, so the
-        // principal's next request can be admitted against the pre-debit
-        // counter. A failed debit is recorded as pending on this replica and
-        // denies until it re-reports; that state is in-process, so a restart
-        // loses it. Tracked so shutdown drains in-flight debits.
-        let core = Arc::clone(&self.core);
-        let report_ext = Extensions {
-            http_transport: extensions.http_transport.clone(),
-            ..Default::default()
-        };
-        let principal = sub.into_owned();
-        self.core.debits.spawn(
-            async move {
-                core.debit(&report_ext, &principal, total).await;
-            }
-            .instrument(tracing::Span::current()),
-        );
+        // The host transport is an invocation-scoped capability. Complete the
+        // debit before returning rather than retaining its handle in a task
+        // that could outlive a revoked `perform_http` grant. A failed debit is
+        // recorded as pending before the next admission can inspect it.
+        self.core.debit(extensions, &sub, total).await;
         PluginResult::allow()
     }
 }
