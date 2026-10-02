@@ -1,35 +1,36 @@
-// Location: ./integrations/cpex-ocsf-audit/src/emitter.rs
-// Copyright 2026 AI Identity
 // SPDX-License-Identifier: Apache-2.0
-//
+// Copyright (c) 2026 Praxis Contributors
+
 // The plugin proper. Mirrors audit-logger::AuditLogger: holds config,
-// implements Plugin + HookHandler<CmfHook>, builds a record, emits,
-// and returns allow() (observation-only, never blocks).
+// implements Plugin + AuditHandler + HookHandler<CmfHook>, builds a
+// record, emits, and returns allow() (observation-only, never blocks).
 //
 // Added over audit-logger:
-//   * OCSF mapping (ocsf::build_ai_operation)
+//   * OCSF mapping (ocsf::build_event, ocsf::apply_decision)
 //   * optional attestation with a tamper-evident hash chain
 //     (fingerprint -> prev_event.fingerprint) threaded across calls
 //   * a pluggable signer (sign::OcsfSigner)
 
+//! The emitter: builds, chains, signs and writes each record.
+
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::host::cmf::{CmfHook, MessagePayload};
-use crate::host::context::PluginContext;
-use crate::host::error::PluginError;
-use crate::host::hooks::payload::Extensions;
-use crate::host::hooks::trait_def::{HookHandler, PluginResult};
-use crate::host::plugin::{Plugin, PluginConfig};
+use praxis_policy_core::cmf::{CmfHook, MessagePayload};
+use praxis_policy_core::context::PluginContext;
+use praxis_policy_core::error::PluginError;
+use praxis_policy_core::hooks::payload::Extensions;
+use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
+use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
 use crate::config::{OcsfAuditConfig, OcsfDestination, SigningMode};
 use crate::ocsf;
-use crate::sign::{canonical_bytes, fingerprint_value, DsseSigner, NoopSigner, OcsfSigner};
+use crate::sign::{DsseSigner, NoopSigner, OcsfSigner, canonical_bytes, fingerprint_value};
 
 /// Back-reference to the preceding record in the chain, i.e. everything
-/// the merged `prev_event` object needs: the predecessor's
+/// the `prev_event` object needs: the predecessor's
 /// `metadata.uid` (schema-required), its `type_uid` (which tells a
 /// consumer the class, and therefore the store, to retrieve it from),
 /// and its fingerprint value (what actually binds the link to content).
@@ -48,6 +49,8 @@ struct ChainState {
     prev: Option<PrevRef>,
 }
 
+/// The plugin: one instance per `audit/ocsf` entry, holding the parsed
+/// config, the signer and the chain state.
 pub struct OcsfAuditEmitter {
     cfg: PluginConfig,
     typed: OcsfAuditConfig,
@@ -56,11 +59,11 @@ pub struct OcsfAuditEmitter {
     chain: Mutex<ChainState>,
 }
 
-/// Build a merged-shape `fingerprint` object around a hex digest.
+/// Build a `fingerprint` object around a hex digest.
 ///
 /// `algorithm_id` 3 = SHA-256, `encoding_id` 1 = Hex, `serialization_id`
-/// 2 = JCS — the last being how a verifier knows which bytes were
-/// hashed (our JCS-style canonicalizer, see sign.rs).
+/// 2 = JCS, the last being how a verifier knows which bytes were hashed
+/// (the JCS-style canonicalizer in `sign.rs`).
 fn fingerprint_obj(value: &str) -> Value {
     json!({
         "algorithm_id": 3,
@@ -83,12 +86,19 @@ impl std::fmt::Debug for OcsfAuditEmitter {
 }
 
 impl OcsfAuditEmitter {
+    /// Parse the plugin's `config:` block and build the signer.
+    ///
+    /// # Errors
+    ///
+    /// A config that does not parse, or `signing: dsse` with no key, both
+    /// keys, or a key that cannot be read or parsed. A missing key fails
+    /// here rather than falling back to unsigned records.
     pub fn new(cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
         let typed: OcsfAuditConfig = match cfg.config.as_ref() {
             Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
                 Box::new(PluginError::Config {
                     message: format!(
-                        "plugin '{}' (cpex-plugin-ocsf-audit) config parse failed: {e}",
+                        "plugin '{}' (praxis-policy-plugin-ocsf-audit) config parse failed: {e}",
                         cfg.name
                     ),
                 })
@@ -99,7 +109,7 @@ impl OcsfAuditEmitter {
         let chain_uid = typed
             .chain_uid
             .clone()
-            // Process-lifetime fallback uid. Not random across restarts —
+            // Process-lifetime fallback uid. Not random across restarts;
             // operators who need a stable chain set chain_uid explicitly.
             .unwrap_or_else(|| format!("ocsf-chain-{}", cfg.name));
 
@@ -107,8 +117,8 @@ impl OcsfAuditEmitter {
             SigningMode::None => Box::new(NoopSigner),
             SigningMode::Dsse => {
                 // A missing/unreadable/invalid key fails construction
-                // loudly. The alternative — falling back to unsigned —
-                // would emit records that LOOK like the operator's
+                // loudly. The alternative, falling back to unsigned,
+                // would emit records that look like the operator's
                 // signing policy while silently lacking the signatures
                 // it promised.
                 let config_err = |message: String| Box::new(PluginError::Config { message });
@@ -116,36 +126,36 @@ impl OcsfAuditEmitter {
                     (Some(inline), None) => inline.clone(),
                     (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
                         config_err(format!(
-                            "plugin '{}' (cpex-plugin-ocsf-audit): signing=dsse could not \
+                            "plugin '{}' (praxis-policy-plugin-ocsf-audit): signing=dsse could not \
                              read signing_key_pem_path '{path}': {e}",
                             cfg.name
                         ))
                     })?,
                     (Some(_), Some(_)) => {
                         return Err(config_err(format!(
-                            "plugin '{}' (cpex-plugin-ocsf-audit): set exactly one of \
+                            "plugin '{}' (praxis-policy-plugin-ocsf-audit): set exactly one of \
                              signing_key_pem / signing_key_pem_path, not both",
                             cfg.name
-                        )))
-                    }
+                        )));
+                    },
                     (None, None) => {
                         return Err(config_err(format!(
-                            "plugin '{}' (cpex-plugin-ocsf-audit): signing=dsse requires a \
-                             key — set signing_key_pem (inline PKCS#8 PEM) or \
+                            "plugin '{}' (praxis-policy-plugin-ocsf-audit): signing=dsse requires a \
+                             key: set signing_key_pem (inline PKCS#8 PEM) or \
                              signing_key_pem_path",
                             cfg.name
-                        )))
-                    }
+                        )));
+                    },
                 };
                 Box::new(
                     DsseSigner::from_pem(&pem, typed.signing_key_id.clone()).map_err(|e| {
                         config_err(format!(
-                            "plugin '{}' (cpex-plugin-ocsf-audit): {e}",
+                            "plugin '{}' (praxis-policy-plugin-ocsf-audit): {e}",
                             cfg.name
                         ))
                     })?,
                 )
-            }
+            },
         };
 
         Ok(Self {
@@ -168,20 +178,20 @@ impl OcsfAuditEmitter {
     }
 
     /// Build a decision-audit event: the same OCSF shape as `build`, with
-    /// the pipeline's ruling overlaid (verdict → action/disposition/status,
-    /// per-plugin steps, span, taint, content hashes and stream stamps
-    /// under `unmapped.cpex.*`) — then chained like any other record.
+    /// the pipeline's ruling overlaid (verdict to action/disposition/status,
+    /// per-plugin steps, span, taint, content digests and stream stamps
+    /// under `unmapped.cpex.*`), then chained like any other record.
     /// `payload` is `None` for a non-CMF dispatch (delegation, identity):
     /// the record still emits, from the extensions alone.
     pub fn build_decision(
         &self,
         payload: Option<&MessagePayload>,
         ext: &Extensions,
-        decisions: &crate::host::decision::DecisionLog,
+        decisions: &praxis_policy_core::decision::DecisionLog,
         now_rfc3339: &str,
     ) -> Value {
         let mut event = ocsf::build_event(payload, ext, &self.typed, now_rfc3339);
-        ocsf::apply_decision(&mut event, payload, decisions);
+        ocsf::apply_decision(&mut event, decisions);
         self.wrap_in_chain(event)
     }
 
@@ -193,61 +203,61 @@ impl OcsfAuditEmitter {
             return event;
         }
 
-        // Predecessor binding, merged-#1661 semantics: the fingerprint
-        // is computed over the canonical serialization of the WHOLE
-        // EVENT, including this attestation's own `uid`, `chain_uid`,
-        // `authority_uid` and `prev_event`, and excluding only
-        // `fingerprint` and `signatures`. So the record's chain position
-        // is inside the hashed input — deleting, reordering or splicing
-        // a record changes its own fingerprint, and every later link
-        // with it.
+        // Predecessor binding: the fingerprint is computed over the
+        // canonical serialization of the whole event, including this
+        // attestation's own `uid`, `chain_uid`, `authority_uid` and
+        // `prev_event`, and excluding only `fingerprint` and `signatures`.
+        // So the record's chain position is inside the hashed input:
+        // deleting, reordering or splicing a record changes its own
+        // fingerprint, and every later link with it. A verifier following
+        // the schema reproduces the bytes without knowing this crate.
         //
-        // This replaces the pre-merge construction, which hashed a
-        // synthetic wrapper `{chain_uid, event, prev_entry_hash}`. That
-        // form preserved the same property but was only reproducible by
-        // a verifier who knew our wrapper convention; the merged form is
-        // reproducible by anyone following the schema.
-        //
-        // Canonical bytes are JCS-style (review C2): key-sorted,
-        // compact, set-derived arrays already sorted at build time
-        // (ocsf.rs).
+        // Canonical bytes are JCS-style: key-sorted, compact, with the
+        // set-derived arrays already sorted at build time (ocsf.rs).
         let mut out = event;
 
         // Held across the whole build: seq allocation, predecessor read
         // and chain advance must be one atomic step, or two concurrent
         // invocations can mint the same uid and fork the chain off the
         // same predecessor. `build` is sync, so there is no await under
-        // the guard.
-        let mut guard = self.chain.lock().unwrap();
+        // the guard. A poisoned lock is recovered rather than propagated:
+        // the state is two plain values and a panic between reading and
+        // advancing them cannot leave either half-written.
+        let mut guard = self
+            .chain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let record_uid = format!("{}-{:06}", self.chain_uid, guard.seq);
         let att_uid = format!("{}-att-{:06}", self.chain_uid, guard.seq);
         let prev = guard.prev.clone();
 
-        // `metadata.uid` identifies this record; the NEXT record's
-        // `prev_event.uid` points at it, so it must exist before we hash.
+        // `metadata.uid` identifies this record; the next record's
+        // `prev_event.uid` points at it, so it must exist before hashing.
         let type_uid = out.get("type_uid").and_then(Value::as_i64).unwrap_or(0);
         if let Some(m) = out.get_mut("metadata").and_then(Value::as_object_mut) {
             m.insert("uid".into(), json!(record_uid));
         }
 
-        // Attestation minus fingerprint/signatures — the hashed form.
-        let mut attestation = json!({
-            "uid": att_uid,
-            "chain_uid": self.chain_uid,
-        });
-        // authority_uid is part of the hashed serialization (merged
-        // #1661 semantics list it alongside chain_uid / prev_event), so
-        // the claimed authority cannot be swapped post-hoc without
-        // breaking the fingerprint — and every signature over it.
+        // Attestation minus fingerprint/signatures: the hashed form.
+        let mut attestation = serde_json::Map::new();
+        attestation.insert("uid".into(), json!(att_uid));
+        attestation.insert("chain_uid".into(), json!(self.chain_uid));
+        // authority_uid is part of the hashed serialization, alongside
+        // chain_uid and prev_event, so the claimed authority cannot be
+        // swapped post-hoc without breaking the fingerprint, and every
+        // signature over it.
         if let Some(authority) = &self.typed.authority_uid {
-            attestation["authority_uid"] = json!(authority);
+            attestation.insert("authority_uid".into(), json!(authority));
         }
         if let Some(p) = &prev {
-            attestation["prev_event"] = json!({
-                "uid": p.uid,
-                "type_uid": p.type_uid,
-                "fingerprint": fingerprint_obj(&p.fingerprint),
-            });
+            attestation.insert(
+                "prev_event".into(),
+                json!({
+                    "uid": p.uid,
+                    "type_uid": p.type_uid,
+                    "fingerprint": fingerprint_obj(&p.fingerprint),
+                }),
+            );
         }
         if let Value::Object(m) = &mut out {
             m.insert("attestation_list".into(), json!([attestation]));
@@ -255,23 +265,31 @@ impl OcsfAuditEmitter {
 
         let bytes = canonical_bytes(&out);
         let this_fp = fingerprint_value(&bytes);
+        let signed = self.signer.sign(&bytes);
 
         // Now fill in the two excluded members.
-        out["attestation_list"][0]["fingerprint"] = fingerprint_obj(&this_fp);
-        if let Some(signed) = self.signer.sign(&bytes) {
-            out["attestation_list"][0]["signatures"] = json!([signed.digital_signature]);
+        if let Some(att) = out
+            .get_mut("attestation_list")
+            .and_then(|l| l.get_mut(0))
+            .and_then(Value::as_object_mut)
+        {
+            att.insert("fingerprint".into(), fingerprint_obj(&this_fp));
+            if let Some(signed) = &signed {
+                att.insert("signatures".into(), json!([signed.digital_signature]));
+            }
+        }
+        if let Some(signed) = signed {
             // The signature bytes (and the JWKS kid that resolves the
-            // public key) have no home on `digital_signature` yet — that
-            // gap is filed as ocsf-schema#1709. Until it lands they ride
-            // in `unmapped`, matching the production reference bundle.
-            // MERGE into any existing `unmapped` — the gap fields from
-            // ocsf.rs already live there, and those are inside the
-            // hashed bytes; only these two post-hash keys are excluded
-            // by a verifier (see sign::signing_input).
+            // public key) have no home on `digital_signature`; that gap
+            // is filed as ocsf-schema#1709. Until it lands they ride in
+            // `unmapped`, merged into any existing `unmapped`: the gap
+            // fields from ocsf.rs already live there, and those are
+            // inside the hashed bytes; only these two post-hash keys are
+            // excluded by a verifier (see sign::signing_input).
             if let Value::Object(m) = &mut out {
                 let un = m
                     .entry("unmapped")
-                    .or_insert_with(|| Value::Object(Default::default()));
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
                 if let Some(un) = un.as_object_mut() {
                     un.insert("signature_b64".into(), json!(signed.signature));
                     if let Some(kid) = &signed.key_id {
@@ -292,12 +310,17 @@ impl OcsfAuditEmitter {
         out
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "writing the record to stderr is what OcsfDestination::Stderr selects; \
+                  the operator asked for this stream by name"
+    )]
     fn emit(&self, event: &Value) {
         match self.typed.destination {
             OcsfDestination::Stderr => eprintln!("{event}"),
             OcsfDestination::Tracing => {
                 tracing::info!(target: "ocsf.audit", event = %event, "ocsf");
-            }
+            },
         }
     }
 }
@@ -308,38 +331,35 @@ impl Plugin for OcsfAuditEmitter {
         &self.cfg
     }
 
-    /// Auto-attach as a decision-audit sink when run in audit-only mode
-    /// (no `hooks:` listed) — the manager then invokes the `AuditHandler`
-    /// impl below at every pipeline verdict, denials included. If the
-    /// operator listed hooks, this runs as a CMF post-hook observer
-    /// instead and does not also auto-attach, so records aren't emitted
-    /// twice for one invocation. (Same contract as the upstream
-    /// audit-logger builtin.)
+    /// Attach as a decision-audit sink when run in audit-only mode (no
+    /// `hooks:` listed): the engine then invokes the `AuditHandler` impl
+    /// below at every pipeline verdict, denials included. If the operator
+    /// listed hooks, this runs as a CMF post-hook observer instead and
+    /// does not also attach, so records are not emitted twice for one
+    /// invocation. (Same contract as the `audit-logger` reference sink.)
     fn as_audit_handler(
         self: std::sync::Arc<Self>,
-    ) -> Option<std::sync::Arc<dyn crate::host::audit::AuditHandler>> {
-        if self.cfg.hooks.is_empty() {
-            Some(self)
-        } else {
-            None
-        }
+    ) -> Option<std::sync::Arc<dyn praxis_policy_core::audit::AuditHandler>> {
+        let attach = self.cfg.hooks.is_empty();
+        let sink: std::sync::Arc<dyn praxis_policy_core::audit::AuditHandler> = self;
+        attach.then_some(sink)
     }
 }
 
-/// Decision-audit consumer — the first-class path off the PR #166 audit
-/// seam. Fires at the verdict of every pipeline run with the finalized
-/// [`DecisionLog`](crate::host::decision::DecisionLog); this is what makes
-/// denials, suppressed transform-denies, panics and modifications visible
-/// to the OCSF stream (a post-hook observer only ever saw allowed
-/// traffic). Awaited on the request path by contract — `handle` stays
-/// serialize-and-emit cheap.
+/// Decision-audit consumer, the sink path. Fires at the verdict of every
+/// pipeline run with the finalized
+/// [`DecisionLog`](praxis_policy_core::decision::DecisionLog); this is
+/// what makes denials, suppressed transform-denies, panics and
+/// modifications visible to the OCSF stream (a post-hook observer only
+/// ever sees allowed traffic). Awaited on the request path by contract,
+/// so `handle` stays serialize-and-emit cheap.
 #[async_trait]
-impl crate::host::audit::AuditHandler for OcsfAuditEmitter {
+impl praxis_policy_core::audit::AuditHandler for OcsfAuditEmitter {
     async fn handle(
         &self,
-        payload: &dyn crate::host::hooks::payload::PluginPayload,
+        payload: &dyn praxis_policy_core::hooks::payload::PluginPayload,
         ext: &Extensions,
-        decisions: &crate::host::decision::DecisionLog,
+        decisions: &praxis_policy_core::decision::DecisionLog,
     ) {
         // Downcast to the CMF payload when this dispatch carried one; a
         // non-CMF dispatch (delegation, identity) records without the
@@ -371,11 +391,19 @@ impl HookHandler<CmfHook> for OcsfAuditEmitter {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
-    use crate::host::cmf::{ContentPart, Message, Role, ToolCall};
-    use crate::host::extensions::{SecurityExtension, SubjectExtension};
-    use crate::host::plugin::{OnError, PluginConfig, PluginMode};
+    use praxis_policy_core::cmf::{ContentPart, Message, Role, ToolCall};
+    use praxis_policy_core::extensions::{SecurityExtension, SubjectExtension};
+    use praxis_policy_core::plugin::{OnError, PluginMode};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -420,15 +448,14 @@ mod tests {
         }
     }
 
-    /// Gap 6: RequestExtension.request_id — the mandate draw-receipt
-    /// join key — rides `unmapped."cmf.request.request_id"` on every
+    /// Gap 6: `RequestExtension.request_id`, the mandate draw-receipt
+    /// join key, rides `unmapped."cmf.request.request_id"` on every
     /// event (dispatch and decision alike), and stays absent when the
     /// request extension is missing. Deliberately not
-    /// metadata.correlation_uid (review C1: that slot is the
-    /// conversation-stable key).
+    /// `metadata.correlation_uid`, which is the conversation-stable key.
     #[test]
     fn request_id_rides_unmapped_as_receipt_join_key() {
-        use crate::host::extensions::RequestExtension;
+        use praxis_policy_core::extensions::RequestExtension;
         let e = OcsfAuditEmitter::new(cfg(json!({ "chain": false }))).unwrap();
 
         let mut ext = subject_ext();
@@ -444,8 +471,8 @@ mod tests {
         assert_ne!(ev["metadata"]["correlation_uid"], "corr-7f3e2a91");
 
         // Decision events built from the same extensions carry it too.
-        use crate::host::decision::{PluginAction, Verdict};
-        let mut log = crate::host::decision::DecisionLog::new();
+        use praxis_policy_core::decision::{PluginAction, Verdict};
+        let mut log = praxis_policy_core::decision::DecisionLog::new();
         log.record("cedar-pdp", PluginMode::Sequential, PluginAction::Allowed);
         log.finalize(Verdict::Allow);
         let dev = e.build_decision(
@@ -466,19 +493,19 @@ mod tests {
         let e = OcsfAuditEmitter::new(cfg(json!({ "chain": false }))).unwrap();
         let ev = e.build(&tool_payload(), &subject_ext(), "2026-06-30T12:00:00.000Z");
 
-        // Host class: API Activity (P0, 2026-07-18 thread).
+        // Host class: API Activity.
         assert_eq!(ev["class_uid"], 6003);
         // No readOnlyHint on this tool -> honest 99 (Other) with a
         // source-defined name, per the OCSF enum contract.
         assert_eq!(ev["activity_id"], 99);
         assert_eq!(ev["activity_name"], "Invoke Tool");
-        assert_eq!(ev["type_uid"], 600399);
+        assert_eq!(ev["type_uid"], 600_399);
         // Passive post-hook stream = security_control Observed/Logged.
         assert_eq!(ev["action_id"], 3);
         assert_eq!(ev["disposition_id"], 17);
-        // Review C1: the per-call id lands at api.request.uid, NOT
-        // correlation_uid (which mirrors the run id and is absent here
-        // because this payload carries no AgentExtension).
+        // The per-call id lands at api.request.uid, not correlation_uid
+        // (which mirrors the run id and is absent here because this
+        // payload carries no AgentExtension).
         assert_eq!(ev["api"]["request"]["uid"], "call-1");
         assert!(ev["metadata"]["correlation_uid"].is_null());
         assert_eq!(ev["tool"]["name"], "get_compensation");
@@ -496,8 +523,8 @@ mod tests {
 
         let (a1, a2) = (&ev1["attestation_list"][0], &ev2["attestation_list"][0]);
 
-        // Genesis record carries no prev_event at all (the merged shape
-        // omits it rather than emitting an explicit null).
+        // Genesis record carries no prev_event at all (the shape omits it
+        // rather than emitting an explicit null).
         assert!(a1.get("prev_event").is_none());
 
         // Second record's prev_event binds the first: fingerprint by
@@ -506,7 +533,7 @@ mod tests {
         assert_eq!(a2["prev_event"]["uid"], ev1["metadata"]["uid"]);
         assert_eq!(a2["prev_event"]["type_uid"], ev1["type_uid"]);
 
-        // Fingerprint is a merged-shape object, bare-hex valued.
+        // Fingerprint is an object, bare-hex valued.
         assert_eq!(a1["fingerprint"]["algorithm_id"], 3);
         assert_eq!(a1["fingerprint"]["encoding_id"], 1);
         assert_eq!(a1["fingerprint"]["serialization_id"], 2);
@@ -521,13 +548,13 @@ mod tests {
 
     #[test]
     fn read_only_hint_maps_tool_call_to_read() {
-        use crate::host::extensions::{MCPExtension, ToolMetadata};
+        use praxis_policy_core::extensions::{MCPExtension, ToolMetadata};
 
         let mut ext = subject_ext();
         ext.mcp = Some(Arc::new(MCPExtension {
             tool: Some(ToolMetadata {
                 name: "get_compensation".into(),
-                annotations: HashMap::from([("readOnlyHint".to_string(), json!(true))]),
+                annotations: HashMap::from([("readOnlyHint".to_owned(), json!(true))]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -539,18 +566,18 @@ mod tests {
         // readOnlyHint: true -> known id 2 with the normalized caption.
         assert_eq!(ev["activity_id"], 2);
         assert_eq!(ev["activity_name"], "Read");
-        assert_eq!(ev["type_uid"], 600302);
+        assert_eq!(ev["type_uid"], 600_302);
     }
 
     #[test]
     fn read_only_hint_for_different_tool_is_ignored() {
-        use crate::host::extensions::{MCPExtension, ToolMetadata};
+        use praxis_policy_core::extensions::{MCPExtension, ToolMetadata};
 
         let mut ext = subject_ext();
         ext.mcp = Some(Arc::new(MCPExtension {
             tool: Some(ToolMetadata {
                 name: "some_other_tool".into(),
-                annotations: HashMap::from([("readOnlyHint".to_string(), json!(true))]),
+                annotations: HashMap::from([("readOnlyHint".to_owned(), json!(true))]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -583,11 +610,9 @@ mod tests {
         );
     }
 
-    /// Review §4-B (fixed 2026-07-20; carried into the merged shape
-    /// 2026-07-31): the predecessor is folded into the hashed input,
-    /// now by `prev_event` living inside the serialized event rather
-    /// than via a synthetic wrapper. Two byte-identical events at
-    /// different chain positions must produce different fingerprints —
+    /// The predecessor is folded into the hashed input, by `prev_event`
+    /// living inside the serialized event. Two byte-identical events at
+    /// different chain positions must produce different fingerprints;
     /// under a plain back-pointer design they collide, so reordering or
     /// splicing records between positions (or chains) is undetectable
     /// from the hashes alone.
@@ -621,10 +646,10 @@ mod tests {
 
     /// Deterministic test key (RFC 6979 makes ECDSA deterministic per
     /// key+message, so signed sample output stays reproducible). PEM is
-    /// generated at runtime — no key material lives in the repo.
+    /// generated at runtime; no key material lives in the repo.
     fn test_key_pem() -> String {
-        use p256::pkcs8::EncodePrivateKey;
-        p256::ecdsa::SigningKey::from_slice(&[0x11u8; 32])
+        use p256::pkcs8::EncodePrivateKey as _;
+        p256::ecdsa::SigningKey::from_slice(&[0x11_u8; 32])
             .unwrap()
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
             .unwrap()
@@ -643,19 +668,19 @@ mod tests {
 
     /// The full independent-verifier loop, from nothing but the emitted
     /// JSON and the public key: reconstruct the signed bytes
-    /// (sign::signing_input), recompute the fingerprint, verify the
+    /// (`sign::signing_input`), recompute the fingerprint, verify the
     /// DSSE signature over the PAE.
     #[test]
     fn signed_event_verifies_offline() {
         use crate::sign::{dsse_pae, signing_input};
-        use base64::Engine;
-        use p256::ecdsa::signature::Verifier;
+        use base64::Engine as _;
+        use p256::ecdsa::signature::Verifier as _;
 
         let e = OcsfAuditEmitter::new(signed_cfg()).unwrap();
         let ev = e.build(&tool_payload(), &full_ext(), "2026-07-31T12:00:00.000Z");
 
         let att = &ev["attestation_list"][0];
-        // #2: authority_uid emitted, and it names the configured party.
+        // authority_uid emitted, and it names the configured party.
         assert_eq!(att["authority_uid"], "org-test-authority");
         // Descriptor carries the verified enum ids: ECDSA (3) / DSSE (5),
         // with normalized captions.
@@ -677,16 +702,16 @@ mod tests {
             .decode(ev["unmapped"]["signature_b64"].as_str().unwrap())
             .unwrap();
         let sig = p256::ecdsa::Signature::from_der(&der).unwrap();
-        let vk = *p256::ecdsa::SigningKey::from_slice(&[0x11u8; 32])
+        let vk = *p256::ecdsa::SigningKey::from_slice(&[0x11_u8; 32])
             .unwrap()
             .verifying_key();
         vk.verify(&dsse_pae(&bytes), &sig)
             .expect("emitted signature must verify offline");
     }
 
-    /// Regression: signing must MERGE into `unmapped`, not replace it —
-    /// the gap fields (stop_reason, mcp, framework, labels, workload)
-    /// live there and are part of the hashed evidence.
+    /// Signing must merge into `unmapped`, not replace it: the gap fields
+    /// (`stop_reason`, mcp, framework, labels, workload) live there and
+    /// are part of the hashed evidence.
     #[test]
     fn signing_preserves_gap_fields_in_unmapped() {
         let e = OcsfAuditEmitter::new(signed_cfg()).unwrap();
@@ -699,9 +724,9 @@ mod tests {
         assert!(un.contains_key("cmf.security.labels"));
     }
 
-    /// authority_uid sits INSIDE the hashed serialization: two otherwise
+    /// `authority_uid` sits inside the hashed serialization: two otherwise
     /// identical records claiming different authorities must fingerprint
-    /// differently — the claimed authority can't be swapped post-hoc.
+    /// differently, so the claimed authority cannot be swapped post-hoc.
     #[test]
     fn authority_uid_is_bound_into_the_fingerprint() {
         let build = |authority: &str| {
@@ -720,7 +745,7 @@ mod tests {
         );
     }
 
-    /// signing=dsse with no key must fail construction loudly — never
+    /// `signing: dsse` with no key must fail construction loudly, never
     /// fall back to silently-unsigned records.
     #[test]
     fn dsse_without_key_fails_construction() {
@@ -738,13 +763,13 @@ mod tests {
         assert!(r.violation.is_none());
     }
 
-    // --- decision-audit sink (PR #166 seam; WS-A / P1) -------------------
+    // --- decision-audit sink ----------------------------------------------
 
-    use crate::host::decision::{DecisionLog, PluginAction, Span, Verdict};
-    use crate::host::error::PluginViolation;
+    use praxis_policy_core::decision::{DecisionLog, PluginAction, Span, Verdict};
+    use praxis_policy_core::error::PluginViolation;
 
-    /// Sink-mode config: no `hooks:` — the factory registers no post-hook
-    /// handlers and the plugin auto-attaches as a decision-audit sink.
+    /// Sink-mode config: no `hooks:`, so the factory registers no post-hook
+    /// handlers and the plugin attaches as a decision-audit sink.
     fn sink_cfg(extra: serde_json::Value) -> PluginConfig {
         PluginConfig {
             hooks: vec![],
@@ -762,11 +787,11 @@ mod tests {
     }
 
     /// Registration contract: audit-only mode (no hooks) attaches as a
-    /// sink; a hook-listed observer does NOT also attach, so one
+    /// sink; a hook-listed observer does not also attach, so one
     /// invocation never emits twice.
     #[test]
     fn audit_handler_attaches_only_in_sink_mode() {
-        use crate::host::plugin::Plugin;
+        use praxis_policy_core::plugin::Plugin as _;
         let sink = Arc::new(OcsfAuditEmitter::new(sink_cfg(json!({}))).unwrap());
         assert!(sink.as_audit_handler().is_some(), "no hooks -> sink");
 
@@ -806,10 +831,10 @@ mod tests {
         assert_eq!(ev["unmapped"]["cpex.decision"]["verdict"], "allow");
     }
 
-    /// The record a post-hook observer could never produce: a denial —
-    /// including the fail-closed panic contract from the hardening round
-    /// (`eda9821`): the violation code (`plugin_panic`) must survive to
-    /// `status_code`, distinguishable from an ordinary `plugin_error`.
+    /// The record a post-hook observer could never produce: a denial,
+    /// including the fail-closed panic contract: the violation code
+    /// (`plugin_panic`) must survive to `status_code`, distinguishable
+    /// from an ordinary `plugin_error`.
     #[test]
     fn deny_verdict_maps_to_denied_with_violation_status() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
@@ -839,17 +864,21 @@ mod tests {
         assert_eq!(ev["disposition"], "Blocked");
         assert_eq!(ev["status_id"], 2);
         assert_eq!(ev["status_code"], "plugin_panic");
-        assert!(ev["status_detail"]
-            .as_str()
-            .unwrap()
-            .contains("task panicked"));
+        assert!(
+            ev["status_detail"]
+                .as_str()
+                .unwrap()
+                .contains("task panicked")
+        );
         let d = &ev["unmapped"]["cpex.decision"];
         assert_eq!(d["verdict"]["deny"]["code"], "plugin_panic");
         assert_eq!(d["steps"][0]["action"], "error");
-        assert!(d["steps"][0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("panicked"));
+        assert!(
+            d["steps"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("panicked")
+        );
     }
 
     #[test]
@@ -895,7 +924,7 @@ mod tests {
             vec![(
                 "strict-transform",
                 PluginMode::Transform,
-                crate::host::deny_ignored(PluginViolation::new("policy_deny", "blocked")),
+                PluginAction::DenyIgnored(Box::new(PluginViolation::new("policy_deny", "blocked"))),
             )],
             Verdict::Allow,
         );
@@ -912,16 +941,12 @@ mod tests {
         assert_eq!(d["deny_ignored"], true, "flat flag for SIEM queries");
     }
 
-    /// A denying step names what objected — where the host binds the
-    /// violation to the step. On PPE `denied` / `deny_ignored` steps
-    /// carry `detail` (code + reason; description / details only when
-    /// set); for a suppressed deny that is the only place the objection
-    /// survives, since no verdict names it. On cpex the step is a unit
-    /// variant and the member is absent — the terminal verdict still
-    /// names the violation at `status_code` / `status_detail`. Either
-    /// way the step vocabulary and the flat flag are unchanged.
+    /// A denying step names what objected: `denied` / `deny_ignored`
+    /// steps carry `detail` (code + reason; description / details only
+    /// when set). For a suppressed deny that is the only place the
+    /// objection survives, since no verdict names it.
     #[test]
-    fn denying_steps_carry_detail_where_the_host_binds_it() {
+    fn denying_steps_carry_their_violation_as_detail() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
         let mut described = PluginViolation::new("pii_present", "unredactable field");
         described.description = Some("ssn in free text".into());
@@ -930,12 +955,15 @@ mod tests {
                 (
                     "strict-transform",
                     PluginMode::Transform,
-                    crate::host::deny_ignored(described),
+                    PluginAction::DenyIgnored(Box::new(described)),
                 ),
                 (
                     "cedar-pdp",
                     PluginMode::Sequential,
-                    crate::host::denied(PluginViolation::new("missing_permission", "no")),
+                    PluginAction::Denied(Box::new(PluginViolation::new(
+                        "missing_permission",
+                        "no",
+                    ))),
                 ),
             ],
             Verdict::Deny(PluginViolation::new("missing_permission", "no")),
@@ -952,32 +980,22 @@ mod tests {
         assert_eq!(ev["unmapped"]["cpex.decision"]["deny_ignored"], true);
         assert_eq!(ev["status_code"], "missing_permission");
 
-        #[cfg(feature = "ppe")]
-        {
-            assert_eq!(steps[0]["detail"]["code"], "pii_present");
-            assert_eq!(steps[0]["detail"]["reason"], "unredactable field");
-            assert_eq!(steps[0]["detail"]["description"], "ssn in free text");
-            assert!(
-                steps[0]["detail"].get("details").is_none(),
-                "empty details map is omitted, not emitted as {{}}"
-            );
-            assert_eq!(steps[1]["detail"]["code"], "missing_permission");
-            assert!(
-                steps[1]["detail"].get("description").is_none(),
-                "no description set, none rendered"
-            );
-        }
-        #[cfg(feature = "cpex")]
-        {
-            assert!(
-                steps[0].get("detail").is_none() && steps[1].get("detail").is_none(),
-                "cpex steps carry no violation, so no detail member: {steps}"
-            );
-        }
+        assert_eq!(steps[0]["detail"]["code"], "pii_present");
+        assert_eq!(steps[0]["detail"]["reason"], "unredactable field");
+        assert_eq!(steps[0]["detail"]["description"], "ssn in free text");
+        assert!(
+            steps[0]["detail"].get("details").is_none(),
+            "empty details map is omitted, not emitted as {{}}"
+        );
+        assert_eq!(steps[1]["detail"]["code"], "missing_permission");
+        assert!(
+            steps[1]["detail"].get("description").is_none(),
+            "no description set, none rendered"
+        );
     }
 
     /// `Aborted` (a concurrent sibling short-circuited the phase) is an
-    /// intentional cancellation — it must not render as an error.
+    /// intentional cancellation; it must not render as an error.
     #[test]
     fn aborted_step_is_not_an_error() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
@@ -987,7 +1005,7 @@ mod tests {
                 (
                     "scanner-a",
                     PluginMode::Concurrent,
-                    crate::host::denied(PluginViolation::new("policy_deny", "blocked")),
+                    PluginAction::Denied(Box::new(PluginViolation::new("policy_deny", "blocked"))),
                 ),
             ],
             Verdict::Deny(PluginViolation::new("policy_deny", "blocked")),
@@ -1006,7 +1024,7 @@ mod tests {
     }
 
     /// Zero-plugin invocations emit one allow record on the seam (dense
-    /// stream); our sink renders it with an empty steps array, not a gap.
+    /// stream); the sink renders it with an empty steps array, not a gap.
     #[test]
     fn zero_step_invocation_emits_allow_record() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
@@ -1027,7 +1045,7 @@ mod tests {
     }
 
     /// Audit sinks fire for every hook family; a non-CMF dispatch carries
-    /// no MessagePayload and must still produce a record.
+    /// no `MessagePayload` and must still produce a record.
     #[test]
     fn non_cmf_dispatch_still_emits() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
@@ -1035,7 +1053,7 @@ mod tests {
             vec![(
                 "cedar-pdp",
                 PluginMode::Sequential,
-                crate::host::denied(PluginViolation::new("missing_permission", "no")),
+                PluginAction::Denied(Box::new(PluginViolation::new("missing_permission", "no"))),
             )],
             Verdict::Deny(PluginViolation::new("missing_permission", "no")),
         );
@@ -1051,7 +1069,7 @@ mod tests {
     }
 
     /// Span, entry taint, content provenance and the stream stamps land
-    /// under unmapped.cpex.* — the seam's counters verbatim.
+    /// under `unmapped.cpex.*`, the seam's counters verbatim.
     #[test]
     fn provenance_and_stream_stamps_land_in_unmapped() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
@@ -1077,25 +1095,25 @@ mod tests {
         assert_eq!(un["cpex.span"]["parent_span_id"], "parent-1");
         assert_eq!(un["cpex.taint.input_labels"], json!(["PII"]));
         assert_eq!(un["cpex.content"]["input_hash"], "in-hash");
-        // Output hash present iff the payload yields audit bytes; either
-        // way the key exists so the claim is explicit.
-        assert!(un["cpex.content"]
-            .as_object()
-            .unwrap()
-            .contains_key("output_hash"));
-        assert_eq!(un["cpex.stream"]["epoch"], 1_755_000_000_000_000_000u64);
+        // The output digest key exists whether or not the engine recorded
+        // one, so the claim is explicit.
+        assert!(
+            un["cpex.content"]
+                .as_object()
+                .unwrap()
+                .contains_key("output_hash")
+        );
+        assert_eq!(un["cpex.stream"]["epoch"], 1_755_000_000_000_000_000_u64);
         assert_eq!(un["cpex.stream"]["stream_id"], "decision");
         assert_eq!(un["cpex.stream"]["stream_seq"], 7);
         assert_eq!(un["cpex.stream"]["emission_seq"], 42);
     }
 
-    /// The output digest is the seam's value, routed through
-    /// `host::output_hash`. On PPE the engine records it on the log and the
-    /// emitter copies it verbatim, key id and all; on cpex the shim hashes
-    /// the payload's audit bytes with the engine's `content_hash`. Either
-    /// way an explicit null, not an absent key, when nothing was digested.
+    /// The output digest is the engine's value: recorded on the log and
+    /// copied verbatim by the emitter, key id and all, and an explicit
+    /// null, not an absent key, when nothing was digested.
     #[test]
-    fn output_hash_comes_from_the_host_shim() {
+    fn output_hash_is_copied_from_the_log() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
         let mut log = finalized(
             vec![("cedar-pdp", PluginMode::Sequential, PluginAction::Allowed)],
@@ -1104,64 +1122,36 @@ mod tests {
         log.set_input_hash(Some("in-hash".into()));
         let payload = tool_payload();
 
-        #[cfg(feature = "ppe")]
-        {
-            log.set_output_hash(Some("hmac-sha256:k1:bbb".into()));
-            let ev = e.build_decision(
-                Some(&payload),
-                &subject_ext(),
-                &log,
-                "2026-08-18T12:00:00.000Z",
-            );
-            assert_eq!(
-                ev["unmapped"]["cpex.content"]["output_hash"], "hmac-sha256:k1:bbb",
-                "copied from the log, never recomputed"
-            );
+        log.set_output_hash(Some("hmac-sha256:k1:bbb".into()));
+        let ev = e.build_decision(
+            Some(&payload),
+            &subject_ext(),
+            &log,
+            "2026-08-18T12:00:00.000Z",
+        );
+        assert_eq!(
+            ev["unmapped"]["cpex.content"]["output_hash"], "hmac-sha256:k1:bbb",
+            "copied from the log, never recomputed"
+        );
 
-            // The engine recorded nothing: null even though a payload is
-            // present, because this sink does not hash on PPE.
-            log.set_output_hash(None);
-            let ev = e.build_decision(
-                Some(&payload),
-                &subject_ext(),
-                &log,
-                "2026-08-18T12:00:00.000Z",
-            );
-            assert_eq!(
-                ev["unmapped"]["cpex.content"]["output_hash"],
-                serde_json::Value::Null
-            );
-        }
-
-        #[cfg(feature = "cpex")]
-        {
-            use crate::host::hooks::payload::PluginPayload as _;
-
-            let expected = crate::host::hooks::payload::content_hash(
-                &payload
-                    .audit_bytes()
-                    .expect("MessagePayload opts in to audit bytes"),
-            );
-            assert!(expected.starts_with("sha256:"));
-            let ev = e.build_decision(
-                Some(&payload),
-                &subject_ext(),
-                &log,
-                "2026-08-18T12:00:00.000Z",
-            );
-            assert_eq!(ev["unmapped"]["cpex.content"]["output_hash"], expected);
-
-            let ev = e.build_decision(None, &subject_ext(), &log, "2026-08-18T12:00:00.000Z");
-            assert_eq!(
-                ev["unmapped"]["cpex.content"]["output_hash"],
-                serde_json::Value::Null
-            );
-        }
+        // The engine recorded nothing: null even though a payload is
+        // present, because this sink does not hash.
+        log.set_output_hash(None);
+        let ev = e.build_decision(
+            Some(&payload),
+            &subject_ext(),
+            &log,
+            "2026-08-18T12:00:00.000Z",
+        );
+        assert_eq!(
+            ev["unmapped"]["cpex.content"]["output_hash"],
+            serde_json::Value::Null
+        );
     }
 
-    /// The decision facts sit INSIDE the hashed bytes: two otherwise
+    /// The decision facts sit inside the hashed bytes: two otherwise
     /// identical genesis records with different stream stamps must
-    /// fingerprint differently — renumbering the stream post-hoc breaks
+    /// fingerprint differently, so renumbering the stream post-hoc breaks
     /// the chain.
     #[test]
     fn decision_facts_are_bound_into_the_fingerprint() {
@@ -1191,7 +1181,7 @@ mod tests {
     /// dyn payload downcasts to CMF and the handler completes.
     #[tokio::test]
     async fn audit_handler_handles_dyn_payload() {
-        use crate::host::audit::AuditHandler;
+        use praxis_policy_core::audit::AuditHandler;
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
         let payload = tool_payload();
         let log = finalized(
@@ -1205,9 +1195,9 @@ mod tests {
     // --- gap-branch coverage --------------------------------------------
     // The happy-path test above only exercises a tool call + subject. These
     // build a fully-populated Extensions set and assert every gap field
-    // lands where CMF-OCSF-FIELD-MAP.md says it should.
+    // lands where the mapping puts it.
 
-    use crate::host::extensions::{
+    use praxis_policy_core::extensions::{
         AgentExtension, CompletionExtension, DelegationExtension, DelegationHop,
         FrameworkExtension, MCPExtension, StopReason, TokenUsage, ToolMetadata, WorkloadIdentity,
     };
@@ -1313,7 +1303,7 @@ mod tests {
             un["cmf.workload_identity"]["attestor"],
             "gke-workload-identity"
         );
-        // monotonic labels — order-independent membership check
+        // monotonic labels: order-independent membership check
         let labels = un["cmf.security.labels"].as_array().expect("labels array");
         assert!(labels.iter().any(|v| v == "PII"));
         assert!(labels.iter().any(|v| v == "secret"));
@@ -1324,21 +1314,21 @@ mod tests {
         let e = OcsfAuditEmitter::new(cfg(json!({ "chain": false }))).unwrap();
         let ev = e.build(&tool_payload(), &full_ext(), "2026-06-30T12:00:00.000Z");
 
-        // ai_agent + lineage (PR #1641)
+        // ai_agent + lineage
         assert_eq!(ev["ai_agent"]["uid"], "agent-7");
         assert_eq!(ev["ai_agent"]["parent_uid"], "orchestrator-1");
-        // Review C1: correlation_uid mirrors the run id
-        // (AgentExtension.conversation_id) so every event of one run
-        // carries the same value — a per-event id correlates nothing.
-        // It lives on `metadata`, which is where OCSF defines it.
+        // correlation_uid mirrors the run id (AgentExtension.conversation_id)
+        // so every event of one run carries the same value; a per-event id
+        // correlates nothing. It lives on `metadata`, which is where OCSF
+        // defines it.
         assert_eq!(ev["metadata"]["correlation_uid"], "conv-9");
         assert!(ev.get("correlation_uid").is_none());
         assert_eq!(ev["api"]["request"]["uid"], "call-1");
-        // message_context tokens (merged)
+        // message_context tokens
         assert_eq!(ev["message_context"]["total_tokens"], 150);
         assert_eq!(ev["ai_model"]["name"], "claude-opus-4-8");
         assert_eq!(ev["duration"], 842);
-        // delegation object (upcoming/Ania)
+        // delegation object
         assert_eq!(ev["delegation"]["depth"], 1);
         assert_eq!(ev["delegation"]["chain"][0]["audience"], "workday-api");
         assert_eq!(
@@ -1347,11 +1337,11 @@ mod tests {
         );
     }
 
-    /// Review C2: HashSet/MonotonicSet iteration order is randomized per
-    /// instance, so the builder must sort set-derived arrays — otherwise
+    /// `HashSet` / `MonotonicSet` iteration order is randomized per
+    /// instance, so the builder must sort set-derived arrays; otherwise
     /// the same logical event canonicalizes to different bytes across
-    /// process runs and an independent verifier can't recompute
-    /// the fingerprint.
+    /// process runs and an independent verifier cannot recompute the
+    /// fingerprint.
     #[test]
     fn set_derived_arrays_are_sorted_for_canonical_hashing() {
         let mut sec = SecurityExtension::default();
@@ -1383,10 +1373,10 @@ mod tests {
         assert_eq!(ev["actor"]["user"]["groups"], json!(["t1", "t2", "t3"]));
     }
 
-    /// Structural OCSF conformance — NOT full schema validation (that needs
-    /// the published schema + a validator; see README). Asserts the base
-    /// event has the required, correctly-typed fields every OCSF consumer
-    /// relies on to route a record.
+    /// Structural OCSF conformance, not full schema validation (that needs
+    /// the published schema and a validator; see the README). Asserts the
+    /// base event has the required, correctly-typed fields every OCSF
+    /// consumer relies on to route a record.
     #[test]
     fn emits_required_ocsf_base_fields() {
         let e = OcsfAuditEmitter::new(cfg(json!({ "chain": false }))).unwrap();

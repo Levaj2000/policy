@@ -1,62 +1,60 @@
-// Location: ./integrations/cpex-ocsf-audit/src/ocsf.rs
-// Copyright 2026 AI Identity
 // SPDX-License-Identifier: Apache-2.0
-//
-// CMF -> OCSF mapping. This is the running-code form of
-// docs/cosai-ws4-ocsf-mapping/CMF-OCSF-FIELD-MAP.md. Each block below
-// cites the field-map row it implements.
+// Copyright (c) 2026 Praxis Contributors
+
+// CMF -> OCSF mapping, the running-code form of the AID-EMIT-1 field map.
+// Each block below names the source slot it implements.
 //
 // Design choices:
-//   * We build a serde_json::Value rather than hand-rolling fully
-//     typed OCSF structs — OCSF object shapes still move release to
-//     release, and a Value keeps the scaffold honest about what's
-//     proposed vs merged.
-//   * Fields with no native OCSF home yet (the five gaps) go under
-//     `unmapped` when cfg.include_gap_fields is set. That is correct
-//     OCSF practice AND it makes the gaps self-documenting in the
-//     emitted evidence.
+//   * The event is built as a serde_json::Value rather than hand-rolled
+//     OCSF structs: OCSF object shapes still move release to release, and
+//     a Value keeps the mapping honest about what is proposed vs merged.
+//   * Fields with no native OCSF home go under `unmapped` when
+//     cfg.include_gap_fields is set. That is correct OCSF practice and it
+//     makes the gaps self-documenting in the emitted evidence.
 //
-// OCSF MODELING NOTE: `ai_operation` is a PROFILE, not a class. PR #1641
-// (merged 2026-06-29, "Add ai_agent object and extend ai_operation profile
-// coverage") makes it contribute `ai_agent` / `ai_model` / `message_context`
-// to existing base classes — all in the Application category (6). The host
-// class is **API Activity (6003)** — agreed with the CPEX team 2026-07-17/18
-// (matches AOS's host-class choice and AI Identity's production gateway).
-// Activity ids follow API Activity's real enum (CRUD + 99 Other), NOT a
-// bespoke enum: per the OCSF enum contract, a known id carries the
-// normalized caption as activity_name; source-defined names ride with 99.
+// OCSF modeling: `ai_operation` is a profile, not a class. It contributes
+// `ai_agent` / `ai_model` / `message_context` to existing base classes in
+// the Application category (6). The host class is API Activity (6003), and
+// activity ids follow API Activity's own enum (CRUD plus 99 Other), not a
+// bespoke one: per the OCSF enum contract a known id carries the normalized
+// caption as activity_name, and source-defined names ride with 99.
 
-use serde_json::{json, Map, Value};
+//! The CMF to OCSF mapping and the decision overlay.
 
-use crate::host::cmf::{ContentPart, MessagePayload};
-use crate::host::decision::{DecisionLog, PluginAction, Verdict};
-use crate::host::hooks::payload::{Extensions, PluginPayload};
+use serde_json::{Map, Value, json};
+
+use praxis_policy_core::cmf::{ContentPart, MessagePayload};
+use praxis_policy_core::decision::{DecisionLog, PluginAction, Verdict};
+use praxis_policy_core::hooks::payload::Extensions;
 
 use crate::config::OcsfAuditConfig;
 
 // --- OCSF identifiers ---
 const SCHEMA_VERSION: &str = "1.9.0";
 const CATEGORY_UID_APPLICATION: u32 = 6;
-/// API Activity — the concrete Application-category class hosting the
-/// ai_operation profile (P0 decision, 2026-07-18 thread).
+/// API Activity, the Application-category class hosting the
+/// `ai_operation` profile.
 const CLASS_UID_API_ACTIVITY: u32 = 6003;
 const SEVERITY_INFORMATIONAL: u32 = 1;
 
-/// OCSF activity on API Activity (6003): 0 Unknown · 1 Create · 2 Read ·
-/// 3 Update · 4 Delete · 99 Other.
+/// OCSF activity on API Activity (6003): 0 Unknown, 1 Create, 2 Read,
+/// 3 Update, 4 Delete, 99 Other.
 ///
-/// Mapping convention (2026-07-18 thread):
-///   * Read Resource / Invoke Prompt        -> 2 (Read)
-///   * Invoke Tool with readOnlyHint: true  -> 2 (Read)
-///   * Invoke Tool otherwise                -> 99 + activity_name "Invoke Tool"
-///     (we can't honestly claim Create/Update/Delete without knowing the
-///     operation; destructiveHint stays context, not a Delete mapping)
-///   * Completion                           -> 99 + activity_name "Completion"
+/// Mapping convention:
+///
+/// * Read Resource / Invoke Prompt: 2 (Read)
+/// * Invoke Tool with `readOnlyHint: true`: 2 (Read)
+/// * Invoke Tool otherwise: 99 with `activity_name` "Invoke Tool" (the
+///   mapping cannot honestly claim Create/Update/Delete without knowing
+///   the operation; `destructiveHint` stays context, not a Delete mapping)
+/// * Completion: 99 with `activity_name` "Completion"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
+    /// 0: no payload, or content this mapping does not classify.
     Unknown,
+    /// 2: a resource read, a prompt, or a tool with `readOnlyHint`.
     Read,
-    /// 99 (Other) with a source-defined activity_name, per the OCSF
+    /// 99 (Other) with a source-defined `activity_name`, per the OCSF
     /// enum contract.
     Other(&'static str),
 }
@@ -73,7 +71,7 @@ impl Activity {
         match self {
             Activity::Unknown => "Unknown",
             // Known id -> normalized enum caption, never a source-defined
-            // string (the AOS pin-1-vary-name practice violates this).
+            // string.
             Activity::Read => "Read",
             Activity::Other(n) => n,
         }
@@ -90,10 +88,10 @@ fn tool_read_only_hint(ext: &Extensions, call_name: Option<&str>) -> bool {
     let Some(tool) = mcp.tool.as_ref() else {
         return false;
     };
-    if let Some(name) = call_name {
-        if tool.name != name {
-            return false;
-        }
+    if let Some(name) = call_name
+        && tool.name != name
+    {
+        return false;
     }
     matches!(
         tool.annotations.get("readOnlyHint"),
@@ -102,19 +100,19 @@ fn tool_read_only_hint(ext: &Extensions, call_name: Option<&str>) -> bool {
 }
 
 /// Infer the OCSF activity from the message content parts (the typed
-/// handler does not receive the hook name, so we classify from content —
-/// which is more robust anyway) plus the MCP tool annotations.
+/// handler does not receive the hook name, so the classification comes
+/// from content, which is also the more robust source) plus the MCP tool
+/// annotations.
 pub fn activity_of(payload: &MessagePayload, ext: &Extensions) -> Activity {
     for part in &payload.message.content {
         match part {
-            // ContentPart variant shapes confirmed against cpex@feat/hil_apl ad666ba (2026-07-06).
             ContentPart::ToolCall { content } => {
                 return if tool_read_only_hint(ext, Some(&content.name)) {
                     Activity::Read
                 } else {
                     Activity::Other("Invoke Tool")
-                }
-            }
+                };
+            },
             ContentPart::ToolResult { .. } => {
                 // Result side of the same invocation; the result part
                 // carries no tool name, so the MCP slot speaks for it.
@@ -123,12 +121,12 @@ pub fn activity_of(payload: &MessagePayload, ext: &Extensions) -> Activity {
                 } else {
                     Activity::Other("Invoke Tool")
                 };
-            }
+            },
             ContentPart::PromptRequest { .. }
             | ContentPart::PromptResult { .. }
             | ContentPart::Resource { .. }
             | ContentPart::ResourceRef { .. } => return Activity::Read,
-            _ => {}
+            _ => {},
         }
     }
     // Plain assistant text / thinking with completion metadata = LLM output.
@@ -143,7 +141,7 @@ pub fn activity_of(payload: &MessagePayload, ext: &Extensions) -> Activity {
     Activity::Unknown
 }
 
-/// Build the OCSF AI Operation event (the inner event, pre-attestation).
+/// Build the OCSF event (the inner event, pre-attestation).
 /// `now_rfc3339` is injected so the caller controls the clock (testable).
 pub fn build_ai_operation(
     payload: &MessagePayload,
@@ -156,10 +154,11 @@ pub fn build_ai_operation(
 
 /// Payload-optional form of [`build_ai_operation`]. The decision-audit
 /// sink fires for every hook family, and a non-CMF dispatch (delegation,
-/// identity) carries no `MessagePayload` — the event is then built from
+/// identity) carries no `MessagePayload`; the event is then built from
 /// the extensions alone, with `activity_id` 0 (Unknown) and no
 /// tool/status coordinates. The extension-derived blocks (actor,
-/// ai_agent, ai_model, delegation, gap fields) are identical either way.
+/// `ai_agent`, `ai_model`, delegation, gap fields) are identical either
+/// way.
 pub fn build_event(
     payload: Option<&MessagePayload>,
     ext: &Extensions,
@@ -188,8 +187,8 @@ pub fn build_event(
     // is action_id 3 (Observed) / disposition_id 17 (Logged). When this
     // event is built by the decision-audit sink, `apply_decision`
     // overwrites these with the pipeline's actual ruling (Denied /
-    // Modified / Allowed) — a post-hook observer structurally cannot see
-    // a denial, which is exactly what the sink path fixes.
+    // Modified / Allowed): a post-hook observer structurally cannot see
+    // a denial, which is exactly what the sink path covers.
     ev.insert("action_id".into(), json!(3));
     ev.insert("action".into(), json!("Observed"));
     ev.insert("disposition_id".into(), json!(17));
@@ -198,8 +197,7 @@ pub fn build_event(
     // metadata + product (field map: `meta`/`request` -> base metadata)
     let mut profiles = vec!["ai_operation", "security_control"];
     if cfg.chain {
-        // `attestation_list` is the record_integrity profile from
-        // PR #1661, merged 2026-07-17 (`2a244bc9`), shipping in 1.9.
+        // `attestation_list` is the record_integrity profile, in 1.9.
         profiles.push("record_integrity");
     }
     let mut metadata = json!({
@@ -209,17 +207,14 @@ pub fn build_event(
     });
 
     // correlation (field map: AgentExtension.conversation_id ->
-    // metadata.correlation_uid). Review C1: the correlation key must be
-    // stable across every event of one run — conversation_id IS the run.
+    // metadata.correlation_uid). The correlation key must be stable
+    // across every event of one run, and conversation_id is the run.
     // Per-event ids (request_id, tool_call_id) correlate nothing;
     // tool_call_id rides at api.request.uid instead (see
-    // attach_capability_coords).
-    //
-    // Placement (2026-07-31): `correlation_uid` is an attribute of
-    // `metadata`, not of base_event — it was previously emitted at the
-    // event root, where no OCSF consumer would look for it.
-    if let Some(cid) = correlation_uid(ext) {
-        metadata["correlation_uid"] = json!(cid);
+    // attach_capability_coords). `correlation_uid` is an attribute of
+    // `metadata`, not of base_event.
+    if let (Some(cid), Some(m)) = (correlation_uid(ext), metadata.as_object_mut()) {
+        m.insert("correlation_uid".into(), json!(cid));
     }
     ev.insert("metadata".into(), metadata);
 
@@ -229,29 +224,29 @@ pub fn build_event(
     }
 
     // --- actor / user (field map: SecurityExtension.SubjectExtension) -
-    if let Some(sec) = ext.security.as_ref() {
-        if let Some(s) = &sec.subject {
-            // roles/teams are HashSets — sort so the emitted event is
-            // canonical and the fingerprint is reproducible (review C2).
-            let mut groups: Vec<&String> = s.teams.iter().collect();
-            groups.sort_unstable();
-            let mut roles: Vec<&String> = s.roles.iter().collect();
-            roles.sort_unstable();
-            ev.insert(
-                "actor".into(),
-                json!({
-                    "user": {
-                        "uid": s.id,
-                        "groups": groups,
-                    },
-                    // roles/permissions ride along as enrichment.
-                    "roles": roles,
-                }),
-            );
-        }
+    if let Some(sec) = ext.security.as_ref()
+        && let Some(s) = &sec.subject
+    {
+        // roles/teams are HashSets: sort so the emitted event is
+        // canonical and the fingerprint is reproducible.
+        let mut groups: Vec<&String> = s.teams.iter().collect();
+        groups.sort_unstable();
+        let mut roles: Vec<&String> = s.roles.iter().collect();
+        roles.sort_unstable();
+        ev.insert(
+            "actor".into(),
+            json!({
+                "user": {
+                    "uid": s.id,
+                    "groups": groups,
+                },
+                // roles/permissions ride along as enrichment.
+                "roles": roles,
+            }),
+        );
     }
 
-    // --- ai_agent (field map: AgentExtension; PR #1641) ---------------
+    // --- ai_agent (field map: AgentExtension) -------------------------
     if let Some(ag) = ext.agent.as_ref() {
         ev.insert(
             "ai_agent".into(),
@@ -286,32 +281,32 @@ pub fn build_event(
         }
     }
 
-    // --- delegation (field map: DelegationExtension; upcoming/Ania) ---
-    if let Some(del) = ext.delegation.as_ref() {
-        if del.delegated || !del.chain.is_empty() {
-            let chain: Vec<Value> = del
-                .chain
-                .iter()
-                .map(|hop| {
-                    json!({
-                        "subject_uid": hop.subject_id,
-                        "audience": hop.audience,
-                        "scopes_granted": hop.scopes_granted,
-                        "ttl_seconds": hop.ttl_seconds,
-                        "timestamp": hop.timestamp.to_rfc3339(),
-                    })
-                })
-                .collect();
-            ev.insert(
-                "delegation".into(),
+    // --- delegation (field map: DelegationExtension) ------------------
+    if let Some(del) = ext.delegation.as_ref()
+        && (del.delegated || !del.chain.is_empty())
+    {
+        let chain: Vec<Value> = del
+            .chain
+            .iter()
+            .map(|hop| {
                 json!({
-                    "depth": del.depth,
-                    "origin_subject_uid": del.origin_subject_id,
-                    "actor_subject_uid": del.actor_subject_id,
-                    "chain": chain,
-                }),
-            );
-        }
+                    "subject_uid": hop.subject_id,
+                    "audience": hop.audience,
+                    "scopes_granted": hop.scopes_granted,
+                    "ttl_seconds": hop.ttl_seconds,
+                    "timestamp": hop.timestamp.to_rfc3339(),
+                })
+            })
+            .collect();
+        ev.insert(
+            "delegation".into(),
+            json!({
+                "depth": del.depth,
+                "origin_subject_uid": del.origin_subject_id,
+                "actor_subject_uid": del.actor_subject_id,
+                "chain": chain,
+            }),
+        );
     }
 
     // --- tool/prompt/resource coordinates from content ----------------
@@ -319,13 +314,13 @@ pub fn build_event(
         attach_capability_coords(&mut ev, p);
     }
 
-    // --- the five gaps -> unmapped (field map §5) ---------------------
+    // --- the gaps -> unmapped -----------------------------------------
     if cfg.include_gap_fields {
         let unmapped = build_unmapped_gaps(ext);
-        if let Value::Object(m) = &unmapped {
-            if !m.is_empty() {
-                ev.insert("unmapped".into(), unmapped);
-            }
+        if let Value::Object(m) = &unmapped
+            && !m.is_empty()
+        {
+            ev.insert("unmapped".into(), unmapped);
         }
     }
 
@@ -338,19 +333,19 @@ fn build_unmapped_gaps(ext: &Extensions) -> Value {
     let mut g = Map::new();
 
     // gap 3: completion.stop_reason
-    if let Some(comp) = ext.completion.as_ref() {
-        if let Some(sr) = &comp.stop_reason {
-            g.insert(
-                "cmf.completion.stop_reason".into(),
-                json!(format!("{sr:?}")),
-            );
-        }
+    if let Some(comp) = ext.completion.as_ref()
+        && let Some(sr) = &comp.stop_reason
+    {
+        g.insert(
+            "cmf.completion.stop_reason".into(),
+            json!(format!("{sr:?}")),
+        );
     }
 
     // gap 1: mcp tool/resource/prompt metadata
     if let Some(mcp) = ext.mcp.as_ref() {
-        // MCPExtension = { tool, resource, prompt } (confirmed cpex@feat/hil_apl ad666ba (2026-07-06)).
-        // Serialized whole; each sub-object carries server_id/namespace/schemas.
+        // MCPExtension = { tool, resource, prompt }. Serialized whole; each
+        // sub-object carries server_id/namespace/schemas.
         g.insert("cmf.mcp".into(), json!(mcp));
     }
 
@@ -369,49 +364,47 @@ fn build_unmapped_gaps(ext: &Extensions) -> Value {
 
     // gap 4: monotonic security labels (taint set)
     if let Some(sec) = ext.security.as_ref() {
-        // SecurityExtension.labels: MonotonicSet<String> (add-only taint),
-        // iterated via .iter() (confirmed cpex@feat/hil_apl ad666ba (2026-07-06)).
+        // SecurityExtension.labels: MonotonicSet<String> (add-only taint).
         let labels = security_labels(sec);
         if !labels.is_empty() {
             g.insert("cmf.security.labels".into(), json!(labels));
         }
     }
 
-    // gap 5: workload attestation (SPIFFE) — partial OCSF home
+    // gap 5: workload attestation (SPIFFE), partial OCSF home
     if let Some(wl) = caller_workload(ext) {
         g.insert("cmf.workload_identity".into(), wl);
     }
 
-    // gap 6: per-request id — the mandate draw-receipt join key. A signed
-    // draw receipt (common/biscuit/receipts.py) names the request's
-    // correlation id; carrying RequestExtension.request_id here lets a
-    // receipt-in-hand reconcile against the OCSF stream the same way it
-    // reconciles against the gateway's chained rows. Deliberately NOT
-    // metadata.correlation_uid: review C1 reserved that for the
-    // conversation-stable key (per-request ids correlate nothing across
-    // events). The token's revocation_id needs no event field — the
-    // receipt itself names it, and correlation joins the two.
-    if let Some(req) = ext.request.as_ref() {
-        if let Some(rid) = &req.request_id {
-            g.insert("cmf.request.request_id".into(), json!(rid));
-        }
+    // gap 6: per-request id, the join key for a signed mandate draw
+    // receipt. A receipt names the request's correlation id; carrying
+    // RequestExtension.request_id here lets a receipt-in-hand reconcile
+    // against the OCSF stream. Deliberately not metadata.correlation_uid,
+    // which is reserved for the conversation-stable key (per-request ids
+    // correlate nothing across events). The token's revocation_id needs
+    // no event field: the receipt itself names it, and correlation joins
+    // the two.
+    if let Some(req) = ext.request.as_ref()
+        && let Some(rid) = &req.request_id
+    {
+        g.insert("cmf.request.request_id".into(), json!(rid));
     }
 
     Value::Object(g)
 }
 
 // ---------------------------------------------------------------------
-// Decision overlay — the WS-A / P1 mapping. Applies the pipeline's
-// ruling (cpex-core DecisionLog, from the PR #166 audit seam) onto an
-// event built by `build_event`, replacing the passive Observed/Logged
-// defaults with what enforcement actually did.
+// Decision overlay. Applies the pipeline's ruling (the engine's
+// DecisionLog, handed to audit sinks at every verdict) onto an event built
+// by `build_event`, replacing the passive Observed/Logged defaults with
+// what enforcement actually did.
 // ---------------------------------------------------------------------
 
 /// A step's violation as the `detail` member: the machine code and the
 /// reason always, the free-text description and structured details only
 /// when the plugin set them. The plugin name is not repeated — the step
 /// already carries it.
-fn violation_detail(v: &crate::host::error::PluginViolation) -> Value {
+fn violation_detail(v: &praxis_policy_core::error::PluginViolation) -> Value {
     let mut out = Map::new();
     out.insert("code".into(), json!(v.code));
     out.insert("reason".into(), json!(v.reason));
@@ -425,27 +418,18 @@ fn violation_detail(v: &crate::host::error::PluginViolation) -> Value {
 }
 
 /// The stable, queryable rendering of one [`PluginAction`]. Deliberately
-/// a fixed snake_case vocabulary (not `Debug` formatting) so SIEM
+/// a fixed `snake_case` vocabulary (not `Debug` formatting) so SIEM
 /// queries survive upstream enum renames; `error` carries its message
 /// beside the action, not inside it.
 fn action_str(a: &PluginAction) -> &'static str {
     match a {
         PluginAction::Allowed => "allowed",
-        // The host decides whether a denying step carries its violation
-        // (PPE) or leaves it on the verdict (cpex); the rendered
-        // vocabulary is the same either way. See `crate::host`.
-        #[cfg(feature = "cpex")]
-        PluginAction::Denied => "denied",
-        #[cfg(feature = "ppe")]
         PluginAction::Denied(_) => "denied",
         PluginAction::ModifiedPayload => "modified_payload",
         PluginAction::ModifiedExtensions => "modified_extensions",
-        // Never rendered as an allow — the step reflects the plugin's
+        // Never rendered as an allow: the step reflects the plugin's
         // actual decision (a suppressed Transform-phase block), per the
         // seam's contract on `PluginAction::DenyIgnored`.
-        #[cfg(feature = "cpex")]
-        PluginAction::DenyIgnored => "deny_ignored",
-        #[cfg(feature = "ppe")]
         PluginAction::DenyIgnored(_) => "deny_ignored",
         // Intentional cancellation (a concurrent sibling short-circuited
         // the phase) — distinct from `error` so it doesn't read as a crash.
@@ -457,23 +441,23 @@ fn action_str(a: &PluginAction) -> &'static str {
 /// Overlay one finalized [`DecisionLog`] onto an event from
 /// [`build_event`], turning a passive observation into a decision record:
 ///
-/// * **Verdict → security_control.** Deny → `action_id` 2 (Denied) /
+/// * **Verdict to `security_control`.** Deny: `action_id` 2 (Denied) /
 ///   `disposition_id` 2 (Blocked), with the violation surfaced at
-///   `status_code` / `status_detail` (`status_id` 2) — so a fail-closed
+///   `status_code` / `status_detail` (`status_id` 2), so a fail-closed
 ///   panic arrives as `status_code: "plugin_panic"`, distinguishable
 ///   from an ordinary `plugin_error` by code. Allow after a payload or
-///   extension modification → `action_id` 4 (Modified) /
-///   `disposition_id` 1 (Allowed). Plain allow → 1 / 1. `activity_*` /
+///   extension modification: `action_id` 4 (Modified) /
+///   `disposition_id` 1 (Allowed). Plain allow: 1 / 1. `activity_*` /
 ///   `type_uid` are untouched: they describe the operation observed, the
 ///   action describes what the control did about it.
-/// * **Everything else → `unmapped.cpex.*`**, inside the hashed bytes
+/// * **Everything else to `unmapped.cpex.*`**, inside the hashed bytes
 ///   when chaining is on, so the decision facts are tamper-evident:
-///   the ordered per-plugin steps (full vocabulary incl. `deny_ignored`
-///   and `aborted`), the invocation span, entry-taint labels, content
-///   provenance (input/output hashes), and the audit-stream stamps
-///   (`epoch` / `stream_id` / `stream_seq` / `emission_seq` — the
-///   completeness and ordering claims from the seam).
-pub fn apply_decision(ev: &mut Value, payload: Option<&MessagePayload>, decisions: &DecisionLog) {
+///   the ordered per-plugin steps (full vocabulary including
+///   `deny_ignored` and `aborted`), the invocation span, entry-taint
+///   labels, content provenance (input/output digests), and the
+///   audit-stream stamps (`epoch` / `stream_id` / `stream_seq` /
+///   `emission_seq`, the completeness and ordering claims from the seam).
+pub fn apply_decision(ev: &mut Value, decisions: &DecisionLog) {
     let Some(map) = ev.as_object_mut() else {
         return;
     };
@@ -487,7 +471,7 @@ pub fn apply_decision(ev: &mut Value, payload: Option<&MessagePayload>, decision
 
     let (action_id, action, disposition_id, disposition, verdict_json) = match decisions.verdict() {
         Some(Verdict::Deny(v)) => {
-            // The violation is the forensic core of a deny — surface it
+            // The violation is the forensic core of a deny: surface it
             // on the base-event status fields where OCSF consumers
             // already look, not only inside the unmapped block.
             map.insert("status_id".into(), json!(2)); // Failure
@@ -500,7 +484,7 @@ pub fn apply_decision(ev: &mut Value, payload: Option<&MessagePayload>, decision
                 "Blocked",
                 json!({ "deny": { "code": v.code, "reason": v.reason } }),
             )
-        }
+        },
         Some(Verdict::Allow) if modified => (4, "Modified", 1, "Allowed", json!("allow")),
         Some(Verdict::Allow) => (1, "Allowed", 1, "Allowed", json!("allow")),
         // The seam finalizes before invoking sinks; `None` would mean a
@@ -513,7 +497,7 @@ pub fn apply_decision(ev: &mut Value, payload: Option<&MessagePayload>, decision
     map.insert("disposition_id".into(), json!(disposition_id));
     map.insert("disposition".into(), json!(disposition));
 
-    // --- unmapped.cpex.* — merged into any existing gap fields --------
+    // --- unmapped.cpex.*, merged into any existing gap fields ---------
     let un = map
         .entry("unmapped")
         .or_insert_with(|| Value::Object(Map::new()));
@@ -523,41 +507,41 @@ pub fn apply_decision(ev: &mut Value, payload: Option<&MessagePayload>, decision
         .steps()
         .iter()
         .map(|s| {
-            let mut step = json!({
-                "plugin": s.plugin_name,
-                "phase": s.phase.to_string(),
-                "action": action_str(&s.action),
-            });
+            let mut step = Map::new();
+            step.insert("plugin".into(), json!(s.plugin_name));
+            step.insert("phase".into(), json!(s.phase.to_string()));
+            step.insert("action".into(), json!(action_str(&s.action)));
             if let PluginAction::Error(e) = &s.action {
-                step["error"] = json!(e);
+                step.insert("error".into(), json!(e));
             }
-            // The violation behind a `denied` / `deny_ignored` step, where
-            // the host seam binds it to the step (PPE; cpex leaves it on
-            // the verdict, so there it is absent). For `deny_ignored` this
-            // is the only place the objection's code survives — no verdict
-            // names it. Same member shape as PPE's own audit-logger.
-            if let Some(v) = crate::host::step_violation(&s.action) {
-                step["detail"] = violation_detail(v);
+            // The violation behind a `denied` / `deny_ignored` step. For
+            // `deny_ignored` this is the only place the objection's code
+            // survives, since no verdict names it. Same member shape as the
+            // `audit-logger` reference sink.
+            if let PluginAction::Denied(v) | PluginAction::DenyIgnored(v) = &s.action {
+                step.insert("detail".into(), violation_detail(v));
             }
-            step
+            Value::Object(step)
         })
         .collect();
-    let mut decision = json!({ "verdict": verdict_json, "steps": steps });
+    let mut decision = Map::new();
+    decision.insert("verdict".into(), verdict_json);
+    decision.insert("steps".into(), Value::Array(steps));
     // Flagged at the top level of the block (not only discoverable by
     // scanning the steps array) so "every suppressed deny" is a flat
-    // SIEM query — the seam's contract is that this must never read as
+    // SIEM query: the seam's contract is that this must never read as
     // a plain allow.
     if decisions
         .steps()
         .iter()
-        .any(|s| crate::host::is_deny_ignored(&s.action))
+        .any(|s| matches!(s.action, PluginAction::DenyIgnored(_)))
     {
-        decision["deny_ignored"] = json!(true);
+        decision.insert("deny_ignored".into(), json!(true));
     }
-    un.insert("cpex.decision".into(), decision);
+    un.insert("cpex.decision".into(), Value::Object(decision));
 
     // The invocation's node identity in the decision graph (W3C ids;
-    // child-span model — parent is the causal edge).
+    // child-span model, where the parent is the causal edge).
     if let Some(span) = decisions.span() {
         un.insert(
             "cpex.span".into(),
@@ -579,18 +563,20 @@ pub fn apply_decision(ev: &mut Value, payload: Option<&MessagePayload>, decision
         );
     }
 
-    // Content provenance — gated on the executor having captured an
-    // input hash (i.e. capture_content_provenance on). Digests only, and
-    // both are the seam's values: on PPE the engine records the output
-    // digest on the log too, keyed, so this sink never hashes and never
-    // holds the key; on cpex `host::output_hash` hashes the final payload
-    // the way the engine hashed the entry one. Opaque strings either way.
+    // Content provenance, gated on the executor having captured an entry
+    // digest (`capture_content_provenance` on). Digests only, and both are
+    // the engine's: it takes them at entry and at emission under the
+    // deployment's content provenance key and puts them on the log, so
+    // this sink never hashes and never holds the key. Each digest names
+    // its scheme and key id (`hmac-sha256:<key_id>:<hex>`, or
+    // `sha256:<hex>` under `content_provenance_key: unkeyed`) and travels
+    // as an opaque string. An explicit null for the output digest, not an
+    // absent key, when the engine recorded none, so the record says "not
+    // hashed" rather than leaving the reader to guess.
     if let Some(input_hash) = decisions.input_hash() {
-        let output_hash =
-            crate::host::output_hash(decisions, payload.map(|p| p as &dyn PluginPayload));
         un.insert(
             "cpex.content".into(),
-            json!({ "input_hash": input_hash, "output_hash": output_hash }),
+            json!({ "input_hash": input_hash, "output_hash": decisions.output_hash() }),
         );
     }
 
@@ -613,17 +599,15 @@ pub fn apply_decision(ev: &mut Value, payload: Option<&MessagePayload>, decision
 }
 
 // ---------------------------------------------------------------------
-// Helpers — small, content-shape-dependent extractors. CMF accessor and
-// variant shapes confirmed against cpex@feat/hil_apl ad666ba (2026-07-06).
+// Helpers: small, content-shape-dependent extractors.
 // ---------------------------------------------------------------------
 
 fn correlation_uid(ext: &Extensions) -> Option<String> {
-    // Review C1: correlation_uid must be multi-event-stable, so it
-    // mirrors the run id (AgentExtension.conversation_id) — NOT
-    // request_id or tool_call_id, which are per-event unique and
-    // correlate nothing. Session-grain grouping stays a join on
-    // ai_agent.instance_uid (session_id); the run is the primary
-    // forensic grain a SIEM keys on.
+    // correlation_uid must be multi-event-stable, so it mirrors the run
+    // id (AgentExtension.conversation_id), not request_id or
+    // tool_call_id, which are per-event unique and correlate nothing.
+    // Session-grain grouping stays a join on ai_agent.instance_uid
+    // (session_id); the run is the primary forensic grain a SIEM keys on.
     ext.agent.as_ref()?.conversation_id.clone()
 }
 
@@ -648,45 +632,45 @@ fn attach_capability_coords(ev: &mut Map<String, Value>, payload: &MessagePayloa
                         "namespace": content.namespace,
                     }),
                 );
-                // Review C1: the per-call id's home is api.request.uid
-                // (one request = one tool call), not correlation_uid.
+                // The per-call id's home is api.request.uid (one request
+                // is one tool call), not correlation_uid.
                 ev.insert(
                     "api".into(),
                     json!({ "request": { "uid": content.tool_call_id } }),
                 );
                 return;
-            }
+            },
             ContentPart::Resource { content } => {
                 ev.insert(
                     "resource".into(),
                     json!({ "uri": content.uri, "type": format!("{:?}", content.resource_type) }),
                 );
                 return;
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 }
 
 // The following two isolate the less-obvious accessor paths to one place
-// each (both confirmed against cpex@feat/hil_apl ad666ba (2026-07-06)).
+// each.
 
-fn security_labels(sec: &crate::host::extensions::SecurityExtension) -> Vec<String> {
+fn security_labels(sec: &praxis_policy_core::extensions::SecurityExtension) -> Vec<String> {
     // MonotonicSet<String>::iter() -> impl Iterator<Item = &String>.
     // The backing HashSet iterates in randomized, seed-dependent order;
     // sort so the emitted array is canonical and the fingerprint an
-    // independent verifier recomputes matches ours (review C2).
+    // independent verifier recomputes matches the emitted one.
     let mut labels: Vec<String> = sec.labels.iter().cloned().collect();
     labels.sort_unstable();
     labels
 }
 
 fn caller_workload(ext: &Extensions) -> Option<Value> {
-    // Confirmed cpex@feat/hil_apl ad666ba (2026-07-06): the resolved inbound workload identity
-    // is reachable at Extensions.security.caller_workload (the executor
-    // applies IdentityPayload.caller_workload onto the security ext).
-    // `this_workload` (the gateway's OWN attested id) is the signer
-    // identity and is handled in sign.rs, not here.
+    // The resolved inbound workload identity is reachable at
+    // Extensions.security.caller_workload (the executor applies
+    // IdentityPayload.caller_workload onto the security ext).
+    // `this_workload` (the gateway's own attested id) is the signer
+    // identity, not a field of the request.
     let sec = ext.security.as_ref()?;
     let wl = sec.caller_workload.as_ref()?;
     Some(json!({

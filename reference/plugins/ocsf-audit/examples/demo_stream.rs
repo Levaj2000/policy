@@ -1,8 +1,7 @@
-// Location: ./integrations/cpex-ocsf-audit/examples/demo_stream.rs
-// Copyright 2026 AI Identity
 // SPDX-License-Identifier: Apache-2.0
-//
-// Demo stream driver — the machine-readable sibling of
+// Copyright (c) 2026 Praxis Contributors
+
+// Demo stream driver, the machine-readable sibling of
 // `decision_sink_demo`. That example is written to be *read*: pretty
 // JSON under `// =====` headers, fixed stamps, chaining off. This one is
 // written to be *consumed*: one compact JSON object per line (NDJSON) on
@@ -11,11 +10,12 @@
 // genuine epoch boundary between them.
 //
 //   DEMO_EPOCH        u64 epoch stamp            (default 1755648000000000000)
-//   DEMO_BASE_SEQ     u64 first stream_seq       (default 0 — an epoch opens at 0, §7)
-//   DEMO_STREAM_ID    stream id                  (default "gw-1:decision" —
-//                     the "<namespace>:<kind>" shape CPEX stamps when the
-//                     host sets plugin_settings.audit_stream_namespace,
-//                     so these beats share a stream with the real beat 06)
+//   DEMO_BASE_SEQ     u64 first stream_seq       (default 0: an epoch opens at 0)
+//   DEMO_STREAM_ID    stream id                  (default "gw-1:decision",
+//                     the "<namespace>:<kind>" shape the engine stamps when
+//                     the host sets engine_settings.audit_stream_namespace,
+//                     so these records share a stream with the one
+//                     `panic_drive` produces)
 //   DEMO_CASES        comma list of case numbers (default "1,2,3,4,5")
 //   DEMO_SIGNING_KEY  PKCS#8 P-256 PEM path; when set, chain + DSSE
 //   DEMO_KEY_ID       JWKS kid stamped on each record
@@ -31,31 +31,40 @@
 //                     "sess-gw-1-boot-7")
 //
 // Cases 1-5 are the same five rulings `decision_sink_demo` documents.
-// Case 6 is the fail-closed panic record as this driver CONSTRUCTS it: a
+// Case 6 is the fail-closed panic record as this driver constructs it: a
 // plugin that panicked under catch_unwind, surfacing as violation code
-// `plugin_panic` on a terminal deny. The demo runner no longer uses it —
-// `panic_drive.rs` drives a real one through the PluginManager — but it
-// stays here as the reference shape of that record.
+// `plugin_panic` on a terminal deny. `panic_drive.rs` drives a real one
+// through the engine; this is the reference shape of that record.
 //
-//   cargo run --example demo_stream
+//   cargo run -p praxis-policy-plugin-ocsf-audit --example demo_stream
 
+#![allow(
+    missing_docs,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "test and example code"
+)]
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::Write as _;
 use std::sync::Arc;
 
 use serde_json::json;
 
-use cpex_plugin_ocsf_audit::OcsfAuditEmitter;
+use praxis_policy_plugin_ocsf_audit::OcsfAuditEmitter;
 
-use cpex_plugin_ocsf_audit::host;
-use cpex_plugin_ocsf_audit::host::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
-use cpex_plugin_ocsf_audit::host::decision::{DecisionLog, PluginAction, Span, Verdict};
-use cpex_plugin_ocsf_audit::host::error::PluginViolation;
-use cpex_plugin_ocsf_audit::host::extensions::{
+use praxis_policy_core::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
+use praxis_policy_core::decision::{DecisionLog, PluginAction, Span, Verdict};
+use praxis_policy_core::error::PluginViolation;
+use praxis_policy_core::extensions::{
     AgentExtension, DelegationExtension, DelegationHop, Extensions, RequestExtension,
     SecurityExtension, SubjectExtension,
 };
-use cpex_plugin_ocsf_audit::host::plugin::{OnError, PluginConfig, PluginMode};
+use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -65,7 +74,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
 }
 
 fn env_str(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
 fn sink() -> OcsfAuditEmitter {
@@ -86,13 +95,13 @@ fn sink() -> OcsfAuditEmitter {
         cfg["signing_key_id"] = json!(env_str("DEMO_KEY_ID", "demo-key-2026-08"));
         // A signed record without an authority is unverifiable: the key
         // is what signed, the authority is the stable party a verifier
-        // checks the resolved key AGAINST. AID-EMIT-1 §6 rejects the
-        // former without the latter.
+        // checks the resolved key against. AID-EMIT-1 section 6 rejects
+        // the former without the latter.
         cfg["authority_uid"] = json!(env_str("DEMO_AUTHORITY", "org-f3576cf6"));
         // Each process owns its own chain. Without a distinct uid the
         // restarted producer restarts the attestation counter too, and
         // its first record collides with the first record of the epoch
-        // before it — which a verifier reads as an idempotent replay and
+        // before it, which a verifier reads as an idempotent replay and
         // refuses to chain.
         cfg["chain_uid"] = json!(env_str("DEMO_CHAIN_UID", "demo-chain-org-f3576cf6"));
     }
@@ -118,7 +127,7 @@ fn tool_request() -> (MessagePayload, Extensions) {
                 content: ToolCall {
                     tool_call_id: "call-042".into(),
                     name: "get_compensation".into(),
-                    arguments: HashMap::from([("employee_id".to_string(), json!("EMP-001234"))]),
+                    arguments: HashMap::from([("employee_id".to_owned(), json!("EMP-001234"))]),
                     namespace: Some("hr".into()),
                 },
             }],
@@ -134,14 +143,13 @@ fn tool_request() -> (MessagePayload, Extensions) {
 
     // Agent identity. Without this the records name no agent at all:
     // `ai_agent` is absent, and so is `metadata.correlation_uid`, which
-    // ocsf.rs maps from `conversation_id` (review C1 — the run is the
+    // ocsf.rs maps from `conversation_id` (the run is the
     // multi-event-stable key; `request_id` identifies one request and
     // correlates nothing). A consumer handed those records has to fall
-    // back to something per-event, which is exactly what the ledger side
-    // did with `corr-7f3e2a91` before this was fixed.
+    // back to something per-event.
     //
     // The agent is the one already named in the delegation chain of the
-    // mandate draw — `agent-7` acting for alice@corp.com — so the two
+    // mandate draw, `agent-7` acting for alice@corp.com, so the two
     // objects agree instead of one knowing the agent and the other not.
     // The run id is stable across the kill and the epoch boundary: a
     // restarted producer is the same conversation, which is the property
@@ -161,8 +169,8 @@ fn tool_request() -> (MessagePayload, Extensions) {
     (payload, ext)
 }
 
-/// The mandate draw carries `request_id` — the id a signed draw receipt
-/// names, and the key the payoff query joins on.
+/// The mandate draw carries `request_id`: the id a signed draw receipt
+/// names, and the key a receipt-to-record query joins on.
 fn mandate_request() -> (MessagePayload, Extensions) {
     let (payload, base) = tool_request();
     let delegation = DelegationExtension {
@@ -206,7 +214,7 @@ fn finalized(
     }
     log.set_span(Span {
         trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
-        span_id: format!("00f067aa0ba9{:04}", emission_seq),
+        span_id: format!("00f067aa0ba9{emission_seq:04}"),
         parent_span_id: Some("00f067aa0ba90200".into()),
     });
     log.set_stream(epoch, stream_id.into(), stream_seq, emission_seq);
@@ -231,8 +239,8 @@ fn main() {
     let mut out = stdout.lock();
 
     for (i, case) in cases.iter().enumerate() {
-        let seq = base_seq + i as u64;
-        let ts = format!("2026-08-21T03:20:{:02}.000Z", i);
+        let seq = base_seq + u64::try_from(i).expect("case index fits in u64");
+        let ts = format!("2026-08-21T03:20:{i:02}.000Z");
 
         let (log, pl, xt) = match case {
             // 1. Clean allow: PDP and PII scan both passed.
@@ -285,10 +293,10 @@ fn main() {
                         vec![(
                             "cedar-pdp",
                             PluginMode::Sequential,
-                            host::denied(PluginViolation::new(
+                            PluginAction::Denied(Box::new(PluginViolation::new(
                                 "missing_permission",
                                 "no grant covers this tool",
-                            )),
+                            ))),
                         )],
                         Verdict::Deny(violation),
                         epoch,
@@ -299,9 +307,9 @@ fn main() {
                     &payload,
                     &ext,
                 )
-            }
+            },
 
-            // 4. Suppressed deny + aborted branch, terminal verdict Allow —
+            // 4. Suppressed deny + aborted branch, terminal verdict Allow:
             //    the record a post-hook observer could not produce.
             4 => (
                 finalized(
@@ -310,7 +318,10 @@ fn main() {
                         (
                             "injection-guard",
                             PluginMode::Transform,
-                            host::deny_ignored(PluginViolation::new("policy_deny", "blocked")),
+                            PluginAction::DenyIgnored(Box::new(PluginViolation::new(
+                                "policy_deny",
+                                "blocked",
+                            ))),
                         ),
                         (
                             "secondary-scan",
@@ -374,7 +385,7 @@ fn main() {
                     &payload,
                     &ext,
                 )
-            }
+            },
 
             other => panic!("unknown demo case {other}"),
         };
@@ -384,12 +395,16 @@ fn main() {
         out.flush().expect("flush record");
     }
 
-    // Park with the records already flushed, so a runner can kill -9 a
-    // live process and show that what reached the sink survived the loss
-    // of the producer — rather than simulating the restart.
     if env_str("DEMO_HOLD", "0") == "1" {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
+        hold();
+    }
+}
+
+/// Park with the records already flushed, so a runner can kill -9 a live
+/// process and show that what reached the sink survived the loss of the
+/// producer, rather than simulating the restart.
+fn hold() -> ! {
+    loop {
+        std::thread::park();
     }
 }

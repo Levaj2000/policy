@@ -1,21 +1,26 @@
-# Sample output: `cargo run --no-default-features --features ppe --example provenance_demo`
+# Sample output: `provenance_demo`
 
-Real OCSF decision records produced by the seam consumer in
+Real OCSF decision records produced by the sink in
 [`src/emitter.rs`](src/emitter.rs) (`build_decision`) from the four finalized
 `DecisionLog`s in [`examples/provenance_demo.rs`](examples/provenance_demo.rs),
 each carrying the two content provenance digests AID-EMIT-1 section 9.2
-describes under `unmapped."cpex.content"`. Generated 2026-10-01 on the PPE host,
-praxis-proxy/policy PR #84 @ `2d717e8` (the head that keys the digest; see
-`PRAXIS-PORT-RESULTS.md`), rustc 1.96.1. Deterministic: timestamps, span ids,
-stream stamps and the demo keys are fixed, so a re-run reproduces this file byte
-for byte.
+describes under `unmapped."cpex.content"`. Deterministic: timestamps, span
+ids, stream stamps and the demo keys are fixed, so a re-run reproduces this
+file byte for byte.
 
-The digests are the engine's. `ContentKey`, the function the PPE executor calls
-at pipeline entry and at emission, digests the payload's canonical audit bytes
-under keys the demo resolves through the engine's secret store (`env` backend,
-the same path `engine_settings.content_provenance_key` takes at startup). The
-example feeds it the bytes and places the result on the log the way the
-executor does; the emitter copies both values and never holds a key.
+```sh
+cargo run -p praxis-policy-plugin-ocsf-audit --example provenance_demo
+```
+
+The digests are the engine's. `ContentKey`, the function the executor calls at
+pipeline entry and at emission, digests the payload's canonical audit bytes
+under keys the demo resolves through the engine's secret store (`file`
+backend, the same path `engine_settings.content_provenance_key` takes at
+startup). The example feeds it the bytes and places the result on the log the
+way the executor does; the emitter copies both values and never holds a key.
+Each digest names its scheme and key id, `hmac-sha256:<key_id>:<hex>` or
+`sha256:<hex>`; a verifier MUST NOT require either scheme, and two digests are
+comparable only when the scheme and key id match.
 
 What each record demonstrates:
 
@@ -39,9 +44,9 @@ What each record demonstrates:
 ## Recomputing the digests
 
 The `// verify` lines at the end carry everything needed: the two demo keys (as
-the engine reads them, the text of the environment variable, not a decoding of
-it), the key-id label, and the canonical audit bytes of each payload. With the
-Python standard library only:
+the engine reads them, the text of the key file, not a decoding of it), the
+key-id label, and the canonical audit bytes of each payload. With the Python
+standard library only:
 
 ```python
 import hashlib, hmac
@@ -54,34 +59,11 @@ print(f"hmac-sha256:{key_id}:{hmac.new(key, data, hashlib.sha256).hexdigest()}")
 print(f"sha256:{hashlib.sha256(data).hexdigest()}")
 ```
 
-All eight digests below were recomputed this way on 2026-10-01 and match. Note
+All eight digests below recompute this way and match. Note
 what the verify lines give away on purpose: the pre-redaction bytes of record 2,
 so the digests can be checked. In a deployment that content exists nowhere once
 the redactor has run; only its digest does, under a key the record does not
 carry.
-
-## The cpex delta
-
-The cpex seam (PR #166) has no provenance key: the executor records the entry
-digest as plain SHA-256, and the sink computes the emission digest the same way
-(`host::output_hash` in `src/lib.rs`). `cargo run --example provenance_demo` on
-that host therefore produces this file with records 1 to 3 carrying the unkeyed
-form, which is record 4's form, over the same bytes. Record 4 and every other
-byte are identical across the two hosts. The delta in full:
-
-```text
-# record 1 and record 3 (unchanged content, both digests)
-"input_hash":  "sha256:7ceff5a2c40cd7b624d7d9b4446e580be4288fead67611a1ee29255bedcb11a1",
-"output_hash": "sha256:7ceff5a2c40cd7b624d7d9b4446e580be4288fead67611a1ee29255bedcb11a1"
-
-# record 2 (redacted)
-"input_hash":  "sha256:f8c4bf039115988963e8ec279a19eb91260ccf08a9fde0dee694d028412e7dc0",
-"output_hash": "sha256:4f0b03c551b1a08a6b3ff971cee4c27a09620d2f3deaf0131b41fa392ebea7b5"
-```
-
-(The `// scheme:` comment lines name the cpex scheme as unkeyed for those three
-records as well.) A verifier MUST NOT require either scheme; both forms are
-opaque strings, comparable only when the scheme and key id match.
 
 ---
 
