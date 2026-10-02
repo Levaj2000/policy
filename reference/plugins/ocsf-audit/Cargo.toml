@@ -1,0 +1,92 @@
+# cpex-plugin-ocsf-audit — CMF plugin that serializes each dispatched
+# request into an OCSF AI Operation event (optionally hash-chained and
+# DSSE-signed) instead of a free-form JSON line.
+#
+# Verified green against contextforge-org/cpex @ feat/hil_apl `ad666ba`
+# (Teryl's verification baseline, 2026-07-06) AND against the public `dev`
+# branch @ `baa9e17` (2026-07-27): cargo build + tests + the example pass
+# on both; `dev` is the public entry point and carries crates/cpex-core.
+# The 2026-07-31 revision (DSSE signer wired, authority_uid, 21 tests)
+# was verified against the local checkout on feat/ocsf-audit-plugin
+# @ `9fe56e5` — re-run against `dev` before any upstream sync.
+#
+# This crate is intentionally standalone (NOT a member of the cpex
+# workspace) so it can live in the AI-Identity repo as a reference
+# implementation. Build it against a local checkout of cpex, or point
+# the dep below at a pinned git rev.
+
+[package]
+name = "cpex-plugin-ocsf-audit"
+version = "0.0.3"
+edition = "2021"
+license = "Apache-2.0"
+description = "CPEX CMF plugin — emit OCSF AI Operation events (DSSE-signed attestation chain)."
+rust-version = "1.96"
+
+[features]
+# Exactly one host engine per build. Source in this crate names engine
+# types through `crate::host::…` (see lib.rs), so the choice is a
+# dependency, not a code path — the OCSF output is identical on both
+# (PRAXIS-PORT-RESULTS.md: byte-identical records).
+#
+#   cpex (default)  contextforge-org/cpex `feat/audit-seam` (PR #166), the
+#                   seam this crate was first verified on. A path dep on a
+#                   sibling checkout — see README "Building".
+#   ppe             praxis-proxy/policy PR #84, Teryl's port of the same
+#                   seam into the Praxis Policy Engine. A git dep pinned
+#                   by rev, so a cpex-only checkout still resolves.
+#
+#   cargo test                                     # cpex
+#   cargo test --no-default-features --features ppe
+default = ["cpex"]
+cpex = ["dep:cpex-core"]
+ppe = ["dep:praxis-policy-core"]
+
+[dependencies]
+# Local checkout (clone cpex next to the AI-Identity repo — see README
+# "Building"). To build without a local checkout, swap in the git dep:
+#   cpex-core = { git = "https://github.com/contextforge-org/cpex", branch = "dev" }
+# Pin a rev rather than tracking `dev` for anything reproducible.
+cpex-core = { path = "../../../cpex/crates/cpex-core", optional = true }
+
+# praxis-proxy/policy main at `da22e0a` (2026-10-02): the squash merge of
+# PR #84, "feat(audit): decision and effect auditing", which closes
+# praxis#11. The audit seam this crate consumes is now on main rather
+# than a PR branch: DecisionLog with input_hash() / output_hash() under
+# the keyed content provenance digest (`hmac-sha256:<key_id>:<hex>`),
+# the audit handler contract, the effect log, and
+# `engine_settings.audit_timeout_milliseconds` bounding each sink call.
+# Pinned to the merge commit rather than the last PR head (`7274480`,
+# which the squash leaves unreachable from main) so the rev stays
+# fetchable without the PR ref. A full SHA, not a branch: main moves.
+# Bump deliberately, with the crate re-verified (PRAXIS-PORT-RESULTS.md
+# records each bump), the same rule as the cpex pin in
+# .github/workflows/rust.yml.
+praxis-policy-core = { git = "https://github.com/praxis-proxy/policy", rev = "da22e0aff86de0bb20c5fae3406f73c40576b078", optional = true }
+
+async-trait = "0.1"
+# 0.22, not the current 0.23: praxis-proxy/policy holds base64 at 0.22
+# because `jsonwebtoken` 11 (identity-jwt) depends on it, and this crate
+# is copied into that tree as `reference/plugins/ocsf-audit`
+# (PRAXIS-INTREE-PLAN.md). Pinning down here keeps the copy a copy and the
+# PPE build on one base64. Only `Engine::{encode,decode}` on
+# `general_purpose::STANDARD` is used, identical across both majors;
+# the conformance vectors are byte-identical either way. Hold it here
+# until the in-tree copy lands or the PPE tree moves.
+base64      = "0.22"
+chrono      = { version = "0.4", features = ["serde"] }
+# ECDSA P-256 for the DSSE signer — same curve as the production JWKS
+# (https://api.ai-identity.co/.well-known/ai-identity-public-keys.json).
+# RustCrypto's ecdsa signs per RFC 6979 (deterministic), which preserves
+# the crate's byte-identical-output-across-runs invariant.
+p256        = { version = "0.14", features = ["ecdsa", "pem", "pkcs8"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+sha2        = "0.11"
+tracing     = "0.1"
+
+[dev-dependencies]
+tokio      = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# Already in the lock as a cpex-core transitive: Executor::execute takes a
+# &TaskTracker, so any embedder driving the executor directly needs it named.
+tokio-util = "0.7"
