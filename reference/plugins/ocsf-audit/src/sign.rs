@@ -83,7 +83,8 @@ fn write_canonical(v: &Value, out: &mut Vec<u8>) {
                 // serde_json's string form is RFC 8785 escaping (two-char
                 // escapes for the control characters that have one, \u00XX
                 // otherwise). `Display` on a `Value` is the compact form.
-                out.extend_from_slice(Value::String(k.clone()).to_string().as_bytes());
+                // Writing a `&str` into a `Vec` cannot fail.
+                let _ = serde_json::to_writer(&mut *out, k);
                 out.push(b':');
                 write_canonical(v, out);
             }
