@@ -84,9 +84,12 @@ epoch, not a gap.
 **F5. Offline verification.** A consumer takes the exported bytes and the authority's public
 key, strips the fields the contract excludes, canonicalizes, recomputes the fingerprint,
 checks the signature over the DSSE PAE, walks `prev_event` back along the chain, and reads
-`stream_seq` per `(epoch, stream_id)`. A dense sequence that opens at 0 means nothing was lost.
-A gap, or a head above 0, is reported as evidence of loss (R8), not as a verification failure:
-the records on either side of the gap still verify on their own. No PPE code is involved.
+`stream_seq` per `(epoch, stream_id)`. A dense sequence that opens at 0 shows no leading or
+interior gap in the exported records. It does not prove the tail was captured: a record lost
+after the last exported one leaves no gap to see, so completeness at the tail needs a trusted
+terminal sequence or checkpoint from the host, which this document does not define. A gap, or
+a head above 0, is reported as evidence of loss (R8), not as a verification failure: the
+records on either side of the gap still verify on their own. No PPE code is involved.
 
 ## Requirements
 
