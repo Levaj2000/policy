@@ -132,6 +132,7 @@ plugins:
     priority: 50
     on_error: fail
     capabilities:
+      - read_subject
       - read_agent
       - read_delegation
       - read_labels
