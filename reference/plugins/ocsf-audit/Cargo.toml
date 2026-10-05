@@ -35,7 +35,7 @@ praxis-policy-core = { workspace = true }
 async-trait = { workspace = true }
 # Same major the builtins declare. Only `Engine::{encode,decode}` on the
 # standard alphabet is used, for the DSSE signature bytes.
-base64      = "0.23"
+base64      = { workspace = true }
 chrono      = { workspace = true }
 p256        = { workspace = true }
 serde       = { workspace = true }
