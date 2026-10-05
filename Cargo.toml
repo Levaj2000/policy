@@ -126,7 +126,8 @@ hmac = "0.13"
 # ECDSA P-256 for the OCSF audit sink's DSSE signatures. RustCrypto's `ecdsa`
 # signs per RFC 6979, so the same key and bytes always give the same
 # signature, which is what keeps the signed conformance vectors reproducible.
-p256 = { version = "0.14", features = ["ecdsa", "pem", "pkcs8"] }
+base64 = "0.23.1"
+p256 = { version = "0.14.0", features = ["ecdsa", "pem", "pkcs8"] }
 
 # Internal crates. Single source of truth for each one's path and version
 # requirement; members depend on these with `{ workspace = true }` so a version
