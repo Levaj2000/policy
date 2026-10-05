@@ -83,8 +83,10 @@ epoch, not a gap.
 
 **F5. Offline verification.** A consumer takes the exported bytes and the authority's public
 key, strips the fields the contract excludes, canonicalizes, recomputes the fingerprint,
-checks the signature over the DSSE PAE, walks `prev_event` back along the chain, and checks
-that `stream_seq` is dense per `(epoch, stream_id)` and opens at 0. No PPE code is involved.
+checks the signature over the DSSE PAE, walks `prev_event` back along the chain, and reads
+`stream_seq` per `(epoch, stream_id)`. A dense sequence that opens at 0 means nothing was lost.
+A gap, or a head above 0, is reported as evidence of loss (R8), not as a verification failure:
+the records on either side of the gap still verify on their own. No PPE code is involved.
 
 ## Requirements
 
@@ -105,7 +107,12 @@ that `stream_seq` is dense per `(epoch, stream_id)` and opens at 0. No PPE code 
   Concurrency is permitted across sinks and across streams, never within one sink's stream.
 - R5. Serializers emit payload content as digests by default. Raw tool or prompt arguments
   appear only under an explicit per-sink opt-in, and the docs say what that exposes. This
-  closes #146 for every sink, not only `audit-logger`.
+  closes #146 for every sink, not only `audit-logger`. A digest of a low-entropy value (an
+  account number, a short prompt) is guessable by anyone holding the exported record, so the
+  digest is keyed where the host provides a key (`engine_settings.content_provenance_key`,
+  #84, rendered as `hmac-sha256:<key_id>:<hex>`), the key never travels with the record, and
+  the unkeyed `sha256:<hex>` form is documented as guessable rather than presented as
+  redaction.
 - R6. A serializer declares the content it reads (the existing sink capabilities), and the
   engine hands it a filtered `Extensions` with nothing else. The queued path carries the same
   filtered view as the inline path.
