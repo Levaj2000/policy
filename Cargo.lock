@@ -2662,7 +2662,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppe-benches"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-cmf"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "praxis-policy-apl-core",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2740,7 +2740,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-runtime"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-builtins"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-orchestration"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures",
  "tokio",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-pdp-diff"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "praxis-policy-apl-cmf",
  "praxis-policy-apl-core",
@@ -2847,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-plugin-audit-logger"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-plugin-pii-scanner"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "praxis-policy-core",
