@@ -95,10 +95,10 @@ pub struct OcsfAuditConfig {
 }
 
 fn default_product_name() -> String {
-    "AI Identity OCSF Audit".to_owned()
+    "Praxis Policy Engine OCSF Audit".to_owned()
 }
 fn default_vendor_name() -> String {
-    "AI Identity".to_owned()
+    "Praxis".to_owned()
 }
 fn default_true() -> bool {
     true
