@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(ev["tool"]["name"], "get_compensation");
         assert_eq!(ev["tool"]["namespace"], "hr");
         assert_eq!(ev["actor"]["user"]["uid"], "alice@corp.com");
-        assert_eq!(ev["metadata"]["product"]["vendor_name"], "AI Identity");
+        assert_eq!(ev["metadata"]["product"]["vendor_name"], "Praxis");
     }
 
     #[test]
