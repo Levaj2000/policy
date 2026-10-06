@@ -180,6 +180,19 @@ records on either side of the gap still verify on their own. No PPE code is invo
   and their guarantees, the three overflow policies and what each does to the stream, the
   digest-only default and its opt-in, and how a consumer verifies a record offline.
 
+**Sensitive data (the engine removes, the sink renders)**
+
+- R22. Sensitive data is removed by the engine before a record is handed to any sink, never by
+  a sink or an exporter. The engine drops from every sink's view the transport secrets no sink
+  should see (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, API-key headers,
+  and an operator-supplied list), and applies the same rule to the open-ended slots (`cmf.mcp`
+  annotations and schemas, violation details), where it drops a value or replaces it with a
+  keyed digest rather than masking it, since a mask destroys evidence and is still a value a
+  sink might hash. Removal happens before the record exists, so it is inside the hashed bytes
+  and a verifier recomputes what was exported. The engine marks what it removed, inside the
+  record (the dropped names, or a count), so a consumer can tell redacted from never present.
+  A sink decides only how to render what it was given, digests by default (R5).
+
 ## Acceptance Examples
 
 - AE1. **Covers R3, R11.** Given `ocsf-audit` wired once to the stderr exporter and once to
@@ -211,6 +224,10 @@ records on either side of the gap still verify on their own. No PPE code is invo
 - AE9. **Covers R19, R20.** Given only the file exporter's output and the public key fetched
   by the key identifier in the record, the standalone validator reports fingerprint, signature,
   chain and stream checks as passing, with no PPE code on the machine.
+- AE10. **Covers R22.** Given a request carrying an `Authorization` header and a tool call
+  whose arguments contain a secret, with `audit-logger` and `ocsf-audit` both attached, neither
+  exported record contains the header value or the secret, both carry the removal marker naming
+  the header, and the `ocsf-audit` record still verifies offline.
 
 ## Success Criteria
 
@@ -252,6 +269,11 @@ records on either side of the gap still verify on their own. No PPE code is invo
   transport optimization only.
 - **Digest-only by default, for every sink.** Making this a serializer-layer rule rather than
   an `audit-logger` fix means a third-party sink inherits the safe default.
+- **The engine redacts, the sink renders.** If each sink redacted for itself, the weakest sink
+  would set the exposure and every new sink would reinvent the list. Done once in the engine,
+  before the record exists, the rule is uniform across sinks and sits inside the hashed bytes,
+  so verification is unaffected. Dropping or keyed-digesting, never masking, keeps records
+  comparable without exposing anything.
 
 ## Dependencies / Assumptions
 
@@ -292,3 +314,7 @@ records on either side of the gap still verify on their own. No PPE code is invo
 - [Affects R20][Technical] Whether the reference plugin resolves its signing key through
   `SecretProvider` directly or through a host-provided key handle, and how the key identifier
   in the record maps to a provider reference.
+- [Affects R22][Technical] The operator-facing shape of the removal list (a fixed set plus an
+  allowlist or denylist of header names and JSON paths), where the removal marker lives (a
+  typed slot or `unmapped`), and whether the open-ended slots are filtered by path or by a
+  value-level rule such as digesting every string above a length.
