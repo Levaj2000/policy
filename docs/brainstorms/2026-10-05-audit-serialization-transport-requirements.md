@@ -191,7 +191,8 @@ records on either side of the gap still verify on their own. No PPE code is invo
   sink might hash. Removal happens before the record exists, so it is inside the hashed bytes
   and a verifier recomputes what was exported. The engine marks what it removed, inside the
   record (the dropped names, or a count), so a consumer can tell redacted from never present.
-  A sink decides only how to render what it was given, digests by default (R5).
+  A sink decides only how to render what it was given, digests by default (R5); the per-sink
+  raw-argument opt-in of R5 renders what survived R22 and cannot restore what it removed.
 
 ## Acceptance Examples
 
@@ -224,16 +225,17 @@ records on either side of the gap still verify on their own. No PPE code is invo
 - AE9. **Covers R19, R20.** Given only the file exporter's output and the public key fetched
   by the key identifier in the record, the standalone validator reports fingerprint, signature,
   chain and stream checks as passing, with no PPE code on the machine.
-- AE10. **Covers R22.** Given a request carrying an `Authorization` header and a tool call
-  whose arguments contain a secret, with `audit-logger` and `ocsf-audit` both attached, neither
-  exported record contains the header value or the secret, both carry the removal marker naming
-  the header, and the `ocsf-audit` record still verifies offline.
+- AE10. **Covers R5, R22.** Given a request carrying an `Authorization` header and a tool call
+  whose arguments contain a secret, with `audit-logger` and `ocsf-audit` both attached and both
+  set to the raw-argument opt-in (so the digest default of R5 is not what hides the secret),
+  neither exported record contains the header value or the secret, both carry the removal
+  marker naming the header, and the `ocsf-audit` record still verifies offline.
 
 ## Success Criteria
 
 - `audit-logger` and `ocsf-audit` both run as serializers behind the same exporter trait, and
   neither emits a record that differs from what it emitted before the split.
-- The queued path exists, is off by default, and every one of AE1 through AE9 is a named
+- The queued path exists, is off by default, and every one of AE1 through AE10 is a named
   test or benchmark in the tree.
 - A consumer holding exported bytes from any built-in exporter can verify an `ocsf-audit`
   record offline against the published contract without reading PPE source.
