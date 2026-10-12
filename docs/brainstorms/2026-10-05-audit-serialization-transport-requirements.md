@@ -221,8 +221,9 @@ records on either side of the gap still verify on their own. No PPE code is invo
 **Docs**
 
 - R21. The auditing guide documents the serializer and exporter split, the two delivery modes
-  and their guarantees, the three overflow policies and what each does to the stream, the
-  digest-only default and its opt-in, and how a consumer verifies a record offline.
+  and their guarantees, the two queue policies and the spill policy and what each does to the
+  stream, the digest-only default and its opt-in, and how a consumer verifies a record
+  offline.
 
 **Sensitive data (the engine removes, the sink renders)**
 
@@ -261,8 +262,9 @@ records on either side of the gap still verify on their own. No PPE code is invo
   epoch opens at `stream_seq` 0. Given a reload instead of a restart, the outgoing executor's
   queue drains under its epoch before the new executor's first record is exported.
 - AE6. **Covers R5.** Given `audit-logger` with default settings and a tool call whose
-  arguments contain a secret, the exported record carries the argument's key and type and not
-  its value. With the opt-in set, it carries the value, and the docs say so.
+  arguments contain a value R22 does not remove (an employee id, say), the exported record
+  carries the argument's key and type and not its value. With the opt-in set, it carries the
+  value, and the docs say so. A value R22 removes is AE10's case: no opt-in brings it back.
 - AE7. **Covers R6.** Given a sink that declares no `read_agent` capability, the record it
   serializes through the queued path has no agent fields, exactly as the inline path filters
   today.
