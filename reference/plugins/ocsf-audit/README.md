@@ -140,12 +140,13 @@ attestation uids are `<chain_uid>-<seq>` and `<chain_uid>-att-<seq>`. So:
   cost is that nothing ties one process's chain to the next.
 
 A configured `chain_uid` is yours to keep per process: do not share one
-across replicas or reuse one after a restart. A per-process component in the uid, and the vectors it changes,
-is an AID-EMIT-1 revision rather than a change here, since the uid is
-inside the hashed bytes.
+across replicas or reuse one after a restart. Tying one process's chain to
+the next, which means a persisted sequence and a uid format that carries
+the generation, is an AID-EMIT-1 revision rather than a change here, since
+the uid is inside the hashed bytes.
 
-**Ordering.** The chain lock covers sequence allocation, canonicalization
-and signing, and is released before the record is written, so two
+**Ordering.** The chain lock covers sequence allocation and
+canonicalization; signing and the write happen after it is released, so two
 concurrent records can reach the destination in the opposite order from
 their chain positions. Order by `prev_event` (or `cpex.stream.stream_seq`),
 never by arrival.
@@ -178,7 +179,12 @@ rule, which [`src/sign.rs`](src/sign.rs) implements as `signing_input`:
    the emitted event is canonical. Parse integers exactly rather than
    through a double: `cpex.stream.epoch` is a nanosecond value past 2^53,
    which Python's `json` keeps and a plain JavaScript `JSON.parse` does
-   not.
+   not. A float needs a correctly rounding parser for the same reason:
+   `0.21000000000000002` and `0.21` are different doubles and canonicalize
+   differently, so a parser that lands one ULP off recomputes a fingerprint
+   that will not match. Python, JavaScript and Go round correctly; a Rust
+   verifier needs `serde_json`'s `float_roundtrip` feature, which this
+   workspace enables.
 4. SHA-256 of those bytes is `fingerprint.value`; the DSSE signature
    verifies over `"DSSEv1" SP 31 SP application/vnd.ocsf.event+json SP
    LEN(bytes) SP bytes`.
