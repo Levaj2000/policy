@@ -70,6 +70,23 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   are the only instants the engine formats; `request.timestamp` and
   `completion.created_at` are host-supplied strings with no format guarantee.
   ([#78](https://github.com/praxis-proxy/policy/issues/78))
+- Added `reference/plugins/ocsf-audit`, an audit sink that renders every
+  decision the engine finalizes as an OCSF API Activity event (class 6003,
+  the `ai_operation` and `security_control` profiles), with the per-plugin
+  steps, span, taint, content digests and stream stamps under `unmapped`.
+  With `chain: true` each record carries an attestation whose fingerprint
+  binds it to its predecessor, and a signing key adds a DSSE signature over
+  the same bytes, so a verifier checks a record offline from the emitted JSON
+  and the public key alone, with no access to the engine. It consumes the
+  audit seam like any sink and never changes a verdict. The record format is
+  specified separately as AID-EMIT-1, pinned from the crate, and the three
+  `SAMPLE-OUTPUT*.md` files next to it are that specification's conformance
+  vectors, reproduced byte for byte by the crate's examples. It joins
+  `pii-scanner` and `audit-logger` as a reference plugin: built, linted and
+  tested here, `publish = false`, outside the builtins umbrella, and a host
+  registers it under `audit/ocsf`. Decisions only for now; effect records
+  keep the trait's ignoring default.
+  ([#12](https://github.com/praxis-proxy/policy/issues/12))
 
 ### Changed
 
@@ -107,6 +124,15 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
     Marking it in the same release that already changes the enum means the next
     source added is not a breaking change.
   ([#93](https://github.com/praxis-proxy/policy/issues/93))
+- **Behavior change for hosts parsing JSON through the engine:** floats now
+  parse to the double their digits name. `serde_json` is built with
+  `float_roundtrip`, where the default parser can land one ULP away. The
+  difference is invisible until something re-serializes a parsed number: a
+  verifier that re-parsed an emitted audit record and recomputed its RFC 8785
+  fingerprint could arrive at a different hash and report an untouched record
+  as tampered. Values that reach policy as numbers are unaffected in
+  comparison semantics; only the last digit of a round-tripped float moves.
+  ([#171](https://github.com/praxis-proxy/policy/pull/171))
 
 ### Removed
 
