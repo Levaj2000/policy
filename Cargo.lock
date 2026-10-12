@@ -2994,18 +2994,20 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-plugin-ocsf-audit"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
  "p256",
  "praxis-policy-core",
+ "ryu",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

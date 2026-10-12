@@ -181,6 +181,11 @@ pub fn build_event(
         json!(CLASS_UID_API_ACTIVITY * 100 + activity.id()),
     );
     ev.insert("severity_id".into(), json!(SEVERITY_INFORMATIONAL));
+    // Known deviation from OCSF 1.9.0, listed in the README: `time` is
+    // `timestamp_t` (millisecond epoch integer) in the schema, and the
+    // RFC 3339 form belongs in `time_dt` under the `datetime` profile.
+    // Inside the hashed bytes, so it moves with the next AID-EMIT-1
+    // revision and regenerated vectors rather than here.
     ev.insert("time".into(), json!(now_rfc3339));
 
     // security_control profile defaults: a passive post-hook observation
@@ -233,6 +238,10 @@ pub fn build_event(
         groups.sort_unstable();
         let mut roles: Vec<&String> = s.roles.iter().collect();
         roles.sort_unstable();
+        // Known deviations from OCSF 1.9.0, listed in the README: `actor`
+        // has no `roles` member, and `user.groups` is an array of `group`
+        // objects, not strings. Hashed, so they move with the next spec
+        // revision and regenerated vectors.
         ev.insert(
             "actor".into(),
             json!({
@@ -620,6 +629,10 @@ fn first_tool_error(payload: &MessagePayload) -> Option<bool> {
     None
 }
 
+// Known deviation from OCSF 1.9.0, listed in the README: API Activity has
+// no top-level `tool` or `resource`; the class carries `resources`
+// (`resource_details[]`). Hashed, so it moves with the next spec revision
+// and regenerated vectors.
 fn attach_capability_coords(ev: &mut Map<String, Value>, payload: &MessagePayload) {
     for part in &payload.message.content {
         match part {

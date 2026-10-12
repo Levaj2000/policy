@@ -36,9 +36,18 @@ pub struct OcsfAuditConfig {
     #[serde(default = "default_true")]
     pub chain: bool,
 
-    /// Stable identifier for this attestation chain (OCSF
-    /// `attestation.chain_uid`). If absent, a process-lifetime uid is
-    /// derived from the plugin name at startup.
+    /// Identifier for this attestation chain (OCSF
+    /// `attestation.chain_uid`). If absent, it is derived from the plugin
+    /// name at startup.
+    ///
+    /// A chain lives for one process: the sequence restarts at zero with
+    /// no predecessor on every start, and `metadata.uid` is
+    /// `<chain_uid>-<seq>`, so the uids are unique only within that
+    /// process. Two processes sharing a `chain_uid`, a restart or a
+    /// replica, mint colliding uids, and a consumer deduplicating by
+    /// `metadata.uid` (AID-EMIT-1 section 6) discards the later records as
+    /// replays. Give every process its own value until the format gains a
+    /// per-process component; the derived default has the same limit.
     #[serde(default)]
     pub chain_uid: Option<String>,
 
@@ -57,6 +66,11 @@ pub struct OcsfAuditConfig {
     /// Mutually exclusive with `signing_key_pem_path`. Inline is for
     /// tests, demos and secret-manager injection; operators with a key
     /// file should prefer the path form.
+    ///
+    /// Consumed at construction: once the signer holds the key, the
+    /// emitter zeroizes and clears this field, and the same entry in the
+    /// raw plugin config, so neither the typed nor the raw config can
+    /// print it through `Debug` or `Serialize`.
     #[serde(default)]
     pub signing_key_pem: Option<String>,
 

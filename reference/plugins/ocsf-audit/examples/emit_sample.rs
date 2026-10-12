@@ -32,6 +32,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use praxis_policy_plugin_ocsf_audit::OcsfAuditEmitter;
+use praxis_policy_plugin_ocsf_audit::sign::canonical_order;
 
 use praxis_policy_core::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
 use praxis_policy_core::extensions::{
@@ -218,10 +219,16 @@ fn main() {
     let ev2 = e.build(&p2, &x2, "2026-06-30T12:00:01.000Z");
 
     println!("// ===== OCSF event 1 — Invoke Tool (get_compensation) =====");
-    println!("{}", serde_json::to_string_pretty(&ev1).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&canonical_order(&ev1)).unwrap()
+    );
     println!();
     println!("// ===== OCSF event 2 — Completion (chained to event 1) =====");
-    println!("{}", serde_json::to_string_pretty(&ev2).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&canonical_order(&ev2)).unwrap()
+    );
     println!();
 
     // Demonstrate the tamper-evident chain: event 2's

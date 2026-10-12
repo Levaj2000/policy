@@ -56,6 +56,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use praxis_policy_plugin_ocsf_audit::OcsfAuditEmitter;
+use praxis_policy_plugin_ocsf_audit::sign::canonical_order;
 
 use praxis_policy_core::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
 use praxis_policy_core::decision::{DecisionLog, PluginAction, Span, Verdict};
@@ -391,7 +392,12 @@ fn main() {
         };
 
         let ev = e.build_decision(Some(pl), xt, &log, &ts);
-        writeln!(out, "{}", serde_json::to_string(&ev).unwrap()).expect("write record");
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&canonical_order(&ev)).unwrap()
+        )
+        .expect("write record");
         out.flush().expect("flush record");
     }
 
