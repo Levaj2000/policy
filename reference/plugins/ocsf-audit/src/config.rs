@@ -11,7 +11,11 @@
 use serde::{Deserialize, Serialize};
 
 /// The `config:` block of an `audit/ocsf` plugin entry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Default` is written out below rather than derived, so that the defaults
+/// an entry gets by omitting the whole `config:` block are the ones
+/// documented on the fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcsfAuditConfig {
     /// Where OCSF events go. The stderr default keeps the demo flow
@@ -107,6 +111,30 @@ pub struct OcsfAuditConfig {
     /// visible in the records themselves.
     #[serde(default = "default_true")]
     pub include_gap_fields: bool,
+}
+
+impl Default for OcsfAuditConfig {
+    /// The same values the `#[serde(default ...)]` attributes above supply,
+    /// through the same functions. A derived `Default` would give `chain`
+    /// and `include_gap_fields` as `false`, which is not what the fields
+    /// say and not what an entry with a `config: {}` block gets: a sink
+    /// running on its defaults would emit records with no attestation, no
+    /// fingerprint and no signature, and nothing would say so.
+    fn default() -> Self {
+        Self {
+            destination: OcsfDestination::default(),
+            product_name: default_product_name(),
+            vendor_name: default_vendor_name(),
+            chain: default_true(),
+            chain_uid: None,
+            signing: SigningMode::default(),
+            signing_key_pem: None,
+            signing_key_pem_path: None,
+            signing_key_id: None,
+            authority_uid: None,
+            include_gap_fields: default_true(),
+        }
+    }
 }
 
 fn default_product_name() -> String {

@@ -131,6 +131,9 @@ impl OcsfAuditEmitter {
                     ),
                 })
             })?,
+            // No `config:` block at all. `OcsfAuditConfig`'s hand-written
+            // `Default` carries the documented field defaults, chaining
+            // included, so this path and a `config: {}` block agree.
             None => OcsfAuditConfig::default(),
         };
 
@@ -833,6 +836,39 @@ mod tests {
         // The path form is untouched and the signer still signs.
         let ev = e.build(&tool_payload(), &subject_ext(), "2026-07-31T12:00:00.000Z");
         assert!(ev["unmapped"]["signature_b64"].is_string());
+    }
+
+    /// A `plugins:` entry can omit `config:` entirely, which is the shape
+    /// every defaulted field invites. The sink must still chain there: an
+    /// unattested record carries no fingerprint and no signature, and
+    /// nothing in it says the integrity seam was off.
+    #[test]
+    fn no_config_block_takes_the_documented_defaults() {
+        let mut c = cfg(json!({}));
+        c.config = None;
+        let e = OcsfAuditEmitter::new(c).unwrap();
+        assert!(e.typed.chain, "chain defaults on");
+        assert!(e.typed.include_gap_fields, "gap fields default on");
+        assert_eq!(e.typed.product_name, "Praxis Policy Engine OCSF Audit");
+        let ev = e.build(&tool_payload(), &subject_ext(), "2026-10-12T12:00:00.000Z");
+        assert!(
+            ev["attestation_list"][0]["fingerprint"]["value"].is_string(),
+            "a sink on its defaults must emit a chained, fingerprinted record: {ev}"
+        );
+    }
+
+    /// `OcsfAuditConfig::default()` is what an entry with no `config:` block
+    /// gets, and deserializing `{}` is what an empty block gets. A field
+    /// whose `serde(default)` and struct default disagree splits the two
+    /// paths silently, which is how `chain` came to be off on one of them.
+    #[test]
+    fn struct_defaults_match_an_empty_config_block() {
+        let from_empty: OcsfAuditConfig = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(
+            serde_json::to_value(OcsfAuditConfig::default()).unwrap(),
+            serde_json::to_value(from_empty).unwrap(),
+            "the struct default and an empty config block must agree"
+        );
     }
 
     /// A key configured with `signing: none` is never consumed by a signer,
