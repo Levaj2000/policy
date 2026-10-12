@@ -16,7 +16,7 @@ The record shape is the difference:
 The engine produces the decision; this sink makes it portable and verifiable
 offline, without the engine having to own a schema. The record format is
 specified host-independently as
-[AID-EMIT-1](https://github.com/Levaj2000/AI-Identity/blob/395d64ed8bea695896af1557e530b0065145f593/docs/specs/aid-emit-1.md),
+[AID-EMIT-1](https://github.com/Levaj2000/AI-Identity/blob/abc7bd887c0af23081d83f083319208b5f50987e/docs/specs/aid-emit-1.md),
 and the three `SAMPLE-OUTPUT*.md` files next to this README are its
 conformance vectors.
 

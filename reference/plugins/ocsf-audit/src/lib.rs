@@ -22,7 +22,7 @@
 //     a sink, so one invocation never emits twice.
 //
 // The record format is specified host-independently as AID-EMIT-1
-// (https://github.com/Levaj2000/AI-Identity/blob/395d64ed8bea695896af1557e530b0065145f593/docs/specs/aid-emit-1.md);
+// (https://github.com/Levaj2000/AI-Identity/blob/abc7bd887c0af23081d83f083319208b5f50987e/docs/specs/aid-emit-1.md);
 // the `aid.*` / `cmf.*` key prefixes under `unmapped` are pinned by that
 // specification and do not follow the engine's name. SAMPLE-OUTPUT.md,
 // SAMPLE-OUTPUT-DECISIONS.md and SAMPLE-OUTPUT-PROVENANCE.md next to this

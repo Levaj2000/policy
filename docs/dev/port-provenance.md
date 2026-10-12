@@ -62,9 +62,10 @@ adaptation to this tree's manifest, lint and comment conventions as separate
 commits, so the port is reviewable against the source. No history was
 rewritten or merged: `git log` on these paths starts at the import commit, and
 the source commit above is the anchor for any later comparison. AID-EMIT-1,
-the record format the sink implements, is pinned to the same commit from the
-crate's README and `lib.rs`, and the three `SAMPLE-OUTPUT*.md` files are the
-conformance vectors that commit names.
+the record format the sink implements, is pinned from the crate's README and
+`lib.rs` to its 1.2.0-draft commit `abc7bd8`, the revision that renamed the
+format's own keys from `cpex.*` to `aid.*`; the three `SAMPLE-OUTPUT*.md`
+files are its conformance vectors, regenerated here under those names.
 
 ## How the import was performed
 
