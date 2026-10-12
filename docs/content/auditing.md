@@ -99,8 +99,10 @@ as an OCSF API Activity event instead: the verdict as `security_control`, the
 steps, span, taint, content digests and stream stamps under `unmapped`, and
 with `chain: true` an attestation whose fingerprint binds the record to its
 predecessor. A signing key adds a DSSE signature over the same bytes, which a
-verifier checks offline with the public key. Its README under
-`reference/plugins/ocsf-audit/` documents the record and the verifier rule.
+verifier checks offline with the public key. It renders decisions only:
+`on_effect` keeps its ignoring default, so effects do not become OCSF events.
+Its README under `reference/plugins/ocsf-audit/` documents the record, the
+verifier rule and the sink's known deviations from the published schema.
 
 ```yaml
 plugins:
@@ -112,6 +114,7 @@ plugins:
       - read_agent
       - read_delegation
       - read_labels
+      - read_workload
     config:
       chain: true
       signing: dsse
