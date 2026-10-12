@@ -4,7 +4,7 @@ Real OCSF decision records produced by the sink in
 [`src/emitter.rs`](src/emitter.rs) (`build_decision`) from the four finalized
 `DecisionLog`s in [`examples/provenance_demo.rs`](examples/provenance_demo.rs),
 each carrying the two content provenance digests AID-EMIT-1 section 9.2
-describes under `unmapped."cpex.content"`. Deterministic: timestamps, span
+describes under `unmapped."aid.content"`. Deterministic: timestamps, span
 ids, stream stamps and the demo keys are fixed, so a re-run reproduces this
 file byte for byte.
 
@@ -113,14 +113,11 @@ carry.
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.content": {
+    "aid.content": {
       "input_hash": "hmac-sha256:c7a7b79c1e0b1704:483b96b8a6742e463cb99fe80e7fd2e416e5a052eb796d3ac27a8fde44b43bdc",
       "output_hash": "hmac-sha256:c7a7b79c1e0b1704:483b96b8a6742e463cb99fe80e7fd2e416e5a052eb796d3ac27a8fde44b43bdc"
     },
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "allowed",
@@ -135,17 +132,20 @@ carry.
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90046",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 46,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 46
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 
@@ -194,14 +194,11 @@ carry.
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.content": {
+    "aid.content": {
       "input_hash": "hmac-sha256:c7a7b79c1e0b1704:535bd7bec78a7c928582f4e135c7e5468401201fa6aea7c6d51bbce74f7552c8",
       "output_hash": "hmac-sha256:c7a7b79c1e0b1704:1c7d162e97c48b1e908a702b74a868511e9fef36324c715e285e2353ea2e31f6"
     },
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "allowed",
@@ -216,17 +213,20 @@ carry.
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90047",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 47,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 47
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 
@@ -275,14 +275,11 @@ carry.
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.content": {
+    "aid.content": {
       "input_hash": "hmac-sha256:14170f79d0136df7:a35cbbed141dacbce73330293a1fd1a52bb3fcb2b7436a810f04e8844bc1d82f",
       "output_hash": "hmac-sha256:14170f79d0136df7:a35cbbed141dacbce73330293a1fd1a52bb3fcb2b7436a810f04e8844bc1d82f"
     },
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "allowed",
@@ -297,17 +294,20 @@ carry.
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90048",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 48,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 48
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 
@@ -356,14 +356,11 @@ carry.
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.content": {
+    "aid.content": {
       "input_hash": "sha256:7ceff5a2c40cd7b624d7d9b4446e580be4288fead67611a1ee29255bedcb11a1",
       "output_hash": "sha256:7ceff5a2c40cd7b624d7d9b4446e580be4288fead67611a1ee29255bedcb11a1"
     },
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "allowed",
@@ -378,17 +375,20 @@ carry.
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90049",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 49,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 49
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 

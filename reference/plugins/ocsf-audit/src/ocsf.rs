@@ -459,7 +459,7 @@ fn action_str(a: &PluginAction) -> &'static str {
 ///   `disposition_id` 1 (Allowed). Plain allow: 1 / 1. `activity_*` /
 ///   `type_uid` are untouched: they describe the operation observed, the
 ///   action describes what the control did about it.
-/// * **Everything else to `unmapped.cpex.*`**, inside the hashed bytes
+/// * **Everything else to `unmapped.aid.*`**, inside the hashed bytes
 ///   when chaining is on, so the decision facts are tamper-evident:
 ///   the ordered per-plugin steps (full vocabulary including
 ///   `deny_ignored` and `aborted`), the invocation span, entry-taint
@@ -506,7 +506,7 @@ pub fn apply_decision(ev: &mut Value, decisions: &DecisionLog) {
     map.insert("disposition_id".into(), json!(disposition_id));
     map.insert("disposition".into(), json!(disposition));
 
-    // --- unmapped.cpex.*, merged into any existing gap fields ---------
+    // --- unmapped.aid.*, merged into any existing gap fields ---------
     let un = map
         .entry("unmapped")
         .or_insert_with(|| Value::Object(Map::new()));
@@ -547,13 +547,13 @@ pub fn apply_decision(ev: &mut Value, decisions: &DecisionLog) {
     {
         decision.insert("deny_ignored".into(), json!(true));
     }
-    un.insert("cpex.decision".into(), Value::Object(decision));
+    un.insert("aid.decision".into(), Value::Object(decision));
 
     // The invocation's node identity in the decision graph (W3C ids;
     // child-span model, where the parent is the causal edge).
     if let Some(span) = decisions.span() {
         un.insert(
-            "cpex.span".into(),
+            "aid.span".into(),
             json!({
                 "trace_id": span.trace_id,
                 "span_id": span.span_id,
@@ -567,7 +567,7 @@ pub fn apply_decision(ev: &mut Value, decisions: &DecisionLog) {
     // pipeline added.
     if !decisions.input_labels().is_empty() {
         un.insert(
-            "cpex.taint.input_labels".into(),
+            "aid.taint.input_labels".into(),
             json!(decisions.input_labels()),
         );
     }
@@ -584,7 +584,7 @@ pub fn apply_decision(ev: &mut Value, decisions: &DecisionLog) {
     // hashed" rather than leaving the reader to guess.
     if let Some(input_hash) = decisions.input_hash() {
         un.insert(
-            "cpex.content".into(),
+            "aid.content".into(),
             json!({ "input_hash": input_hash, "output_hash": decisions.output_hash() }),
         );
     }
@@ -596,7 +596,7 @@ pub fn apply_decision(ev: &mut Value, decisions: &DecisionLog) {
     // post-hoc renumbering breaks the fingerprint chain.
     if decisions.stream_seq().is_some() {
         un.insert(
-            "cpex.stream".into(),
+            "aid.stream".into(),
             json!({
                 "epoch": decisions.epoch(),
                 "stream_id": decisions.stream_id(),

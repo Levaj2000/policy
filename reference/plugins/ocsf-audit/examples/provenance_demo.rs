@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// Demo: content provenance digests, the `unmapped."cpex.content"` block
+// Demo: content provenance digests, the `unmapped."aid.content"` block
 // AID-EMIT-1 section 9.2 describes. A decision record never carries the
 // payload; it carries two digests of it, one taken at pipeline entry and
 // one at emission, so a reader can tell whether the pipeline altered the

@@ -29,7 +29,7 @@ objection's code survives, since no verdict names it.
 What each record demonstrates:
 
 1. **Allow (clean).** `action: Allowed` / `disposition: Allowed`; the ordered
-   per-plugin steps and the terminal verdict under `unmapped."cpex.decision"`.
+   per-plugin steps and the terminal verdict under `unmapped."aid.decision"`.
 2. **Allow after modification.** `action: Modified`, never re-coded as a plain
    allow.
 3. **Deny.** `action: Denied` / `disposition: Blocked`, with the
@@ -48,8 +48,8 @@ What each record demonstrates:
    a signed draw receipt names, so a receipt-in-hand reconciles against this
    stream.
 
-Every decision record also carries the invocation span (`unmapped."cpex.span"`)
-and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
+Every decision record also carries the invocation span (`unmapped."aid.span"`)
+and the seam's completeness and ordering stamps (`unmapped."aid.stream"`:
 `epoch` / `stream_id` / `stream_seq` / `emission_seq`).
 
 ---
@@ -99,10 +99,7 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "allowed",
@@ -117,17 +114,20 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90041",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 41,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 41
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 
@@ -175,10 +175,7 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "allowed",
@@ -193,17 +190,20 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90042",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 42,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 42
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 
@@ -254,10 +254,7 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "denied",
@@ -276,17 +273,20 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
         }
       }
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90043",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 43,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 43
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 
@@ -334,10 +334,7 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.decision": {
+    "aid.decision": {
       "deny_ignored": true,
       "steps": [
         {
@@ -362,17 +359,20 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90044",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 44,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 44
-    }
+    },
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 
@@ -436,11 +436,7 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
   },
   "type_uid": 600399,
   "unmapped": {
-    "cmf.request.request_id": "corr-7f3e2a91",
-    "cmf.security.labels": [
-      "PII"
-    ],
-    "cpex.decision": {
+    "aid.decision": {
       "steps": [
         {
           "action": "allowed",
@@ -455,17 +451,21 @@ and the seam's completeness and ordering stamps (`unmapped."cpex.stream"`:
       ],
       "verdict": "allow"
     },
-    "cpex.span": {
+    "aid.span": {
       "parent_span_id": "00f067aa0ba90200",
       "span_id": "00f067aa0ba90045",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
     },
-    "cpex.stream": {
+    "aid.stream": {
       "emission_seq": 45,
       "epoch": 1755648000000000000,
       "stream_id": "gw-1/boot-7",
       "stream_seq": 45
-    }
+    },
+    "cmf.request.request_id": "corr-7f3e2a91",
+    "cmf.security.labels": [
+      "PII"
+    ]
   }
 }
 

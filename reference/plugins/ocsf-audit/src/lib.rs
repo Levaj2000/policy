@@ -23,7 +23,7 @@
 //
 // The record format is specified host-independently as AID-EMIT-1
 // (https://github.com/Levaj2000/AI-Identity/blob/395d64ed8bea695896af1557e530b0065145f593/docs/specs/aid-emit-1.md);
-// the `cpex.*` / `cmf.*` key prefixes under `unmapped` are pinned by that
+// the `aid.*` / `cmf.*` key prefixes under `unmapped` are pinned by that
 // specification and do not follow the engine's name. SAMPLE-OUTPUT.md,
 // SAMPLE-OUTPUT-DECISIONS.md and SAMPLE-OUTPUT-PROVENANCE.md next to this
 // crate are its conformance vectors, produced by the three examples of the

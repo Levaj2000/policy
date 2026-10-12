@@ -234,7 +234,7 @@ impl OcsfAuditEmitter {
     /// Build a decision-audit event: the same OCSF shape as `build`, with
     /// the pipeline's ruling overlaid (verdict to action/disposition/status,
     /// per-plugin steps, span, taint, content digests and stream stamps
-    /// under `unmapped.cpex.*`), then chained like any other record.
+    /// under `unmapped.aid.*`), then chained like any other record.
     /// `payload` is `None` for a non-CMF dispatch (delegation, identity):
     /// the record still emits, from the extensions alone.
     pub fn build_decision(
@@ -1105,12 +1105,12 @@ mod tests {
         // The operation classification is untouched by the ruling.
         assert_eq!(ev["class_uid"], 6003);
         assert_eq!(ev["activity_name"], "Invoke Tool");
-        let steps = ev["unmapped"]["cpex.decision"]["steps"].as_array().unwrap();
+        let steps = ev["unmapped"]["aid.decision"]["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0]["plugin"], "cedar-pdp");
         assert_eq!(steps[0]["phase"], "sequential");
         assert_eq!(steps[0]["action"], "allowed");
-        assert_eq!(ev["unmapped"]["cpex.decision"]["verdict"], "allow");
+        assert_eq!(ev["unmapped"]["aid.decision"]["verdict"], "allow");
     }
 
     /// The record a post-hook observer could never produce: a denial,
@@ -1152,7 +1152,7 @@ mod tests {
                 .unwrap()
                 .contains("task panicked")
         );
-        let d = &ev["unmapped"]["cpex.decision"];
+        let d = &ev["unmapped"]["aid.decision"];
         assert_eq!(d["verdict"]["deny"]["code"], "plugin_panic");
         assert_eq!(d["steps"][0]["action"], "error");
         assert!(
@@ -1189,7 +1189,7 @@ mod tests {
         // The request still proceeded.
         assert_eq!(ev["disposition_id"], 1);
         assert_eq!(
-            ev["unmapped"]["cpex.decision"]["steps"][0]["action"],
+            ev["unmapped"]["aid.decision"]["steps"][0]["action"],
             "modified_payload"
         );
     }
@@ -1218,7 +1218,7 @@ mod tests {
         );
 
         assert_eq!(ev["action_id"], 1, "enforcement outcome was allow");
-        let d = &ev["unmapped"]["cpex.decision"];
+        let d = &ev["unmapped"]["aid.decision"];
         assert_eq!(d["steps"][0]["action"], "deny_ignored");
         assert_eq!(d["deny_ignored"], true, "flat flag for SIEM queries");
     }
@@ -1256,10 +1256,10 @@ mod tests {
             &log,
             "2026-08-18T12:00:00.000Z",
         );
-        let steps = &ev["unmapped"]["cpex.decision"]["steps"];
+        let steps = &ev["unmapped"]["aid.decision"]["steps"];
         assert_eq!(steps[0]["action"], "deny_ignored");
         assert_eq!(steps[1]["action"], "denied");
-        assert_eq!(ev["unmapped"]["cpex.decision"]["deny_ignored"], true);
+        assert_eq!(ev["unmapped"]["aid.decision"]["deny_ignored"], true);
         assert_eq!(ev["status_code"], "missing_permission");
 
         assert_eq!(steps[0]["detail"]["code"], "pii_present");
@@ -1299,7 +1299,7 @@ mod tests {
             "2026-08-18T12:00:00.000Z",
         );
 
-        let steps = ev["unmapped"]["cpex.decision"]["steps"].as_array().unwrap();
+        let steps = ev["unmapped"]["aid.decision"]["steps"].as_array().unwrap();
         assert_eq!(steps[0]["action"], "aborted");
         assert!(steps[0].get("error").is_none());
         assert_eq!(steps[1]["action"], "denied");
@@ -1320,7 +1320,7 @@ mod tests {
 
         assert_eq!(ev["action_id"], 1);
         assert_eq!(
-            ev["unmapped"]["cpex.decision"]["steps"],
+            ev["unmapped"]["aid.decision"]["steps"],
             json!([]),
             "explicit empty steps, not absence"
         );
@@ -1351,7 +1351,7 @@ mod tests {
     }
 
     /// Span, entry taint, content provenance and the stream stamps land
-    /// under `unmapped.cpex.*`, the seam's counters verbatim.
+    /// under `unmapped.aid.*`, the seam's counters verbatim.
     #[test]
     fn provenance_and_stream_stamps_land_in_unmapped() {
         let e = OcsfAuditEmitter::new(sink_cfg(json!({ "chain": false }))).unwrap();
@@ -1373,22 +1373,22 @@ mod tests {
         );
 
         let un = &ev["unmapped"];
-        assert_eq!(un["cpex.span"]["trace_id"], "trace-1");
-        assert_eq!(un["cpex.span"]["parent_span_id"], "parent-1");
-        assert_eq!(un["cpex.taint.input_labels"], json!(["PII"]));
-        assert_eq!(un["cpex.content"]["input_hash"], "in-hash");
+        assert_eq!(un["aid.span"]["trace_id"], "trace-1");
+        assert_eq!(un["aid.span"]["parent_span_id"], "parent-1");
+        assert_eq!(un["aid.taint.input_labels"], json!(["PII"]));
+        assert_eq!(un["aid.content"]["input_hash"], "in-hash");
         // The output digest key exists whether or not the engine recorded
         // one, so the claim is explicit.
         assert!(
-            un["cpex.content"]
+            un["aid.content"]
                 .as_object()
                 .unwrap()
                 .contains_key("output_hash")
         );
-        assert_eq!(un["cpex.stream"]["epoch"], 1_755_000_000_000_000_000_u64);
-        assert_eq!(un["cpex.stream"]["stream_id"], "decision");
-        assert_eq!(un["cpex.stream"]["stream_seq"], 7);
-        assert_eq!(un["cpex.stream"]["emission_seq"], 42);
+        assert_eq!(un["aid.stream"]["epoch"], 1_755_000_000_000_000_000_u64);
+        assert_eq!(un["aid.stream"]["stream_id"], "decision");
+        assert_eq!(un["aid.stream"]["stream_seq"], 7);
+        assert_eq!(un["aid.stream"]["emission_seq"], 42);
     }
 
     /// The output digest is the engine's value: recorded on the log and
@@ -1412,7 +1412,7 @@ mod tests {
             "2026-08-18T12:00:00.000Z",
         );
         assert_eq!(
-            ev["unmapped"]["cpex.content"]["output_hash"], "hmac-sha256:k1:bbb",
+            ev["unmapped"]["aid.content"]["output_hash"], "hmac-sha256:k1:bbb",
             "copied from the log, never recomputed"
         );
 
@@ -1426,7 +1426,7 @@ mod tests {
             "2026-08-18T12:00:00.000Z",
         );
         assert_eq!(
-            ev["unmapped"]["cpex.content"]["output_hash"],
+            ev["unmapped"]["aid.content"]["output_hash"],
             serde_json::Value::Null
         );
     }

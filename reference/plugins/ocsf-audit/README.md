@@ -39,13 +39,13 @@ conformance vectors.
 - **`unmapped`.** Fields with no native OCSF home, under their source names:
   `cmf.completion.stop_reason`, `cmf.mcp`, `cmf.framework`,
   `cmf.security.labels`, `cmf.workload_identity`, `cmf.request.request_id`.
-  And the decision facts: `cpex.decision` (verdict, the ordered per-plugin
+  And the decision facts: `aid.decision` (verdict, the ordered per-plugin
   steps with the full action vocabulary including `deny_ignored` and
-  `aborted`, a flat `deny_ignored` flag), `cpex.span`,
-  `cpex.taint.input_labels`, `cpex.content` (the engine's entry and
-  emission digests) and `cpex.stream` (`epoch`, `stream_id`, `stream_seq`,
+  `aborted`, a flat `deny_ignored` flag), `aid.span`,
+  `aid.taint.input_labels`, `aid.content` (the engine's entry and
+  emission digests) and `aid.stream` (`epoch`, `stream_id`, `stream_seq`,
   `emission_seq`). All of it is inside the hashed bytes, so the decision
-  facts are tamper-evident. The `cpex.*` and `cmf.*` prefixes are pinned by
+  facts are tamper-evident. The `aid.*` and `cmf.*` prefixes are pinned by
   AID-EMIT-1 and do not follow the engine's name.
 - **`attestation_list[0]`** when `chain: true`: `uid`, `chain_uid`,
   `authority_uid`, `prev_event` (the predecessor's uid, `type_uid` and
@@ -148,7 +148,7 @@ the uid is inside the hashed bytes.
 **Ordering.** The chain lock covers sequence allocation and
 canonicalization; signing and the write happen after it is released, so two
 concurrent records can reach the destination in the opposite order from
-their chain positions. Order by `prev_event` (or `cpex.stream.stream_seq`),
+their chain positions. Order by `prev_event` (or `aid.stream.stream_seq`),
 never by arrival.
 
 ## Configuration
@@ -177,7 +177,7 @@ rule, which [`src/sign.rs`](src/sign.rs) implements as `signing_input`:
    floats in the ES6 `Number::toString` form (`1.0` is `1`, `1e21` is
    `1e+21`). The set-derived arrays are already sorted at build time, so
    the emitted event is canonical. Parse integers exactly rather than
-   through a double: `cpex.stream.epoch` is a nanosecond value past 2^53,
+   through a double: `aid.stream.epoch` is a nanosecond value past 2^53,
    which Python's `json` keeps and a plain JavaScript `JSON.parse` does
    not. A float needs a correctly rounding parser for the same reason:
    `0.21000000000000002` and `0.21` are different doubles and canonicalize
@@ -207,7 +207,7 @@ unification turns on `serde_json`'s `preserve_order`.
 |---|---|---|
 | `emit_sample` | `SAMPLE-OUTPUT.md` | Two chained, signed post-hook records and the offline verification loop. |
 | `decision_sink_demo` | `SAMPLE-OUTPUT-DECISIONS.md` | The five rulings: allow, allow after modification, deny, suppressed deny with an aborted branch, and a delegated mandate draw. |
-| `provenance_demo` | `SAMPLE-OUTPUT-PROVENANCE.md` | The `cpex.content` digests under the engine's keyed and unkeyed schemes, with the keys and bytes to recompute them. |
+| `provenance_demo` | `SAMPLE-OUTPUT-PROVENANCE.md` | The `aid.content` digests under the engine's keyed and unkeyed schemes, with the keys and bytes to recompute them. |
 | `demo_stream` | | NDJSON driver with the stream stamps taken from the environment, for runners that need an epoch boundary between processes. |
 | `panic_drive` | | A real plugin panic through `PolicyEngine`, landing as a `plugin_panic` deny on the host-named stream. |
 
