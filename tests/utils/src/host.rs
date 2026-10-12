@@ -395,9 +395,9 @@ fn apply_response_assertions(
     }
 }
 
-/// `attach_delegated_tokens`: one `Bearer` header per outbound name, first
+/// `attach_delegated_tokens`: one delegated value per outbound name, first
 /// audience wins, and the inbound credential headers removed once any is
-/// attached.
+/// attached. Each token carries its own prefix (`Bearer `, `token `, or bare).
 fn attach_delegated_tokens(queued: &mut Queued, extensions: Option<&Extensions>) -> usize {
     let Some(raw) = extensions.and_then(|e| e.raw_credentials.as_deref()) else {
         return 0;
@@ -413,9 +413,10 @@ fn attach_delegated_tokens(queued: &mut Queued, extensions: Option<&Extensions>)
     for token in tokens {
         let name = token.outbound_header.to_ascii_lowercase();
         if attached.insert(name.clone()) {
-            queued
-                .set
-                .push((name, format!("Bearer {}", token.token.as_str())));
+            queued.set.push((
+                name,
+                format!("{}{}", token.outbound_prefix, token.token.as_str()),
+            ));
         }
     }
     if !attached.is_empty() {
@@ -1109,5 +1110,52 @@ impl RefHost {
         });
         outcome.errors = trace.errors;
         outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use praxis_policy_core::extensions::raw_credentials::{
+        DelegationKey, DelegationMode, RawCredentialsExtension, RawDelegatedToken,
+    };
+
+    use super::*;
+
+    fn attach_value(header: &str, prefix: &str, secret: &str) -> Vec<(String, String)> {
+        let mut raw = RawCredentialsExtension::default();
+        raw.delegated_tokens.insert(
+            DelegationKey::new(DelegationMode::OnBehalfOfUser, "api", Vec::new()),
+            RawDelegatedToken::new(
+                secret,
+                header,
+                "api",
+                Vec::new(),
+                "2026-01-01T00:00:00Z".parse().expect("valid timestamp"),
+            )
+            .with_outbound_prefix(prefix),
+        );
+        let extensions = Extensions {
+            raw_credentials: Some(Arc::new(raw)),
+            ..Default::default()
+        };
+        let mut queued = Queued::default();
+        assert_eq!(attach_delegated_tokens(&mut queued, Some(&extensions)), 1);
+        queued.set
+    }
+
+    #[test]
+    fn delegated_header_values_honor_their_explicit_prefix() {
+        assert_eq!(
+            attach_value("Authorization", "Bearer ", "oauth-token"),
+            [("authorization".to_owned(), "Bearer oauth-token".to_owned())]
+        );
+        assert_eq!(
+            attach_value("Authorization", "token ", "ghp_example"),
+            [("authorization".to_owned(), "token ghp_example".to_owned())]
+        );
+        assert_eq!(
+            attach_value("X-API-Key", "", "api-secret"),
+            [("x-api-key".to_owned(), "api-secret".to_owned())]
+        );
     }
 }

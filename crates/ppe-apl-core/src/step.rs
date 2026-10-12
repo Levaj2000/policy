@@ -110,8 +110,9 @@ pub(crate) enum Step {
 ///
 /// Multiple `delegate(...)` steps in the same phase are supported —
 /// each fires independently, each contributes to `Extensions`
-/// (`raw_credentials.delegated_tokens` is a `HashMap` keyed on
-/// audience+scope+mode so tokens accumulate; `delegation.chain`
+/// (`raw_credentials.delegated_tokens` is a `HashMap` keyed on delegator,
+/// target, audience, scope, mode, and principal identity so tokens accumulate;
+/// `delegation.chain`
 /// grows with each hop). But the `delegation.granted.*` bag keys
 /// are **overwritten** on each call — only the most recent
 /// delegate's grants are queryable from downstream `require(...)`
