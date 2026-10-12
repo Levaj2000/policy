@@ -850,7 +850,13 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "ratio": { "type": "number", "minimum": 0.0, "maximum": 2.0, "default": 1.0 },
-                        "big": { "type": "number", "maximum": 1e21 }
+                        "big": { "type": "number", "maximum": 1e21 },
+                        // The shape a bound computed by whoever published
+                        // the schema takes: `0.21000000000000002`,
+                        // seventeen significant digits and one ULP from
+                        // `0.21`. Written as the product so the digits are
+                        // not a magic literal.
+                        "step": { "type": "number", "default": 0.07 * 3.0 }
                     }
                 })),
                 annotations: HashMap::from([
@@ -892,6 +898,29 @@ mod tests {
             .verifying_key();
         vk.verify(&dsse_pae(&bytes), &sig)
             .expect("signature over the ES6-form bytes must verify");
+
+        // The whole point of a canonical form is that a verifier reaches it
+        // from the emitted text, so walk the README's four steps from the
+        // serialized record rather than from the `Value` in hand. This is
+        // the step that holds the float parser to its side of the contract:
+        // `serde_json` without `float_roundtrip` re-parses a value such as
+        // `0.21000000000000002` one ULP off, recanonicalizes different bytes
+        // and reports an untouched record as tampered.
+        let emitted = serde_json::to_string(&ev).unwrap();
+        let reparsed: Value = serde_json::from_str(&emitted).unwrap();
+        let reparsed_bytes = signing_input(&reparsed);
+        assert_eq!(
+            reparsed_bytes, bytes,
+            "a verifier must reach the same canonical bytes from the emitted text"
+        );
+        assert_eq!(
+            crate::sign::fingerprint_value(&reparsed_bytes),
+            ev["attestation_list"][0]["fingerprint"]["value"]
+                .as_str()
+                .unwrap()
+        );
+        vk.verify(&dsse_pae(&reparsed_bytes), &sig)
+            .expect("the signature must verify from the reparsed record");
     }
 
     /// Signing must merge into `unmapped`, not replace it: the gap fields
