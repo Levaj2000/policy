@@ -44,6 +44,8 @@ serde       = { workspace = true }
 serde_json  = { workspace = true }
 sha2        = { workspace = true }
 tracing     = { workspace = true }
+# Random per-process component of the default `chain_uid`.
+uuid        = { workspace = true }
 # Scrubs the inline signing key from both config copies once the signer
 # holds it, as the Vault delegator does with its literal secrets.
 zeroize     = { workspace = true }

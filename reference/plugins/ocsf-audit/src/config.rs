@@ -37,17 +37,17 @@ pub struct OcsfAuditConfig {
     pub chain: bool,
 
     /// Identifier for this attestation chain (OCSF
-    /// `attestation.chain_uid`). If absent, it is derived from the plugin
-    /// name at startup.
+    /// `attestation.chain_uid`). If absent, one is minted at startup from
+    /// the plugin name and a random per-process component.
     ///
     /// A chain lives for one process: the sequence restarts at zero with
     /// no predecessor on every start, and `metadata.uid` is
     /// `<chain_uid>-<seq>`, so the uids are unique only within that
-    /// process. Two processes sharing a `chain_uid`, a restart or a
-    /// replica, mint colliding uids, and a consumer deduplicating by
+    /// process. Two processes sharing a configured `chain_uid`, a restart
+    /// or a replica, mint colliding uids, and a consumer deduplicating by
     /// `metadata.uid` (AID-EMIT-1 section 6) discards the later records as
-    /// replays. Give every process its own value until the format gains a
-    /// per-process component; the derived default has the same limit.
+    /// replays. Give every process its own value, or leave it unset and
+    /// take the per-process default.
     #[serde(default)]
     pub chain_uid: Option<String>,
 

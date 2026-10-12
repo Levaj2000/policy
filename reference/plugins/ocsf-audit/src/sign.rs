@@ -34,7 +34,8 @@ use sha2::{Digest as _, Sha256};
 ///
 /// This is what the fingerprint and the signer consume, so an independent
 /// verifier can recompute the hash from the emitted JSON with any RFC 8785
-/// library, without depending on this serializer's internals. The rules:
+/// library whose JSON parser keeps integers beyond 2^53 exact, without
+/// depending on this serializer's internals. The rules:
 ///
 /// * object keys sorted by UTF-16 code units (RFC 8785 section 3.2.3),
 ///   explicitly rather than via `serde_json`'s map order: a `BTreeMap`

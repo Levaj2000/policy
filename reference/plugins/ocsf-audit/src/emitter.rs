@@ -45,7 +45,10 @@ struct PrevRef {
 /// The chain's position, held for the life of the emitter and nowhere
 /// else. It starts at sequence zero with no predecessor on every process
 /// start, so a chain spans one process and the uids it mints are unique
-/// only within that process; see `OcsfAuditConfig::chain_uid`.
+/// only within that process. The default `chain_uid` carries a random
+/// per-process component so two processes never mint the same uid; a
+/// configured one is the operator's to keep per process (see
+/// `OcsfAuditConfig::chain_uid`).
 #[derive(Default)]
 struct ChainState {
     /// Monotonic per-emitter counter. Drives deterministic record and
@@ -129,14 +132,14 @@ impl OcsfAuditEmitter {
             None => OcsfAuditConfig::default(),
         };
 
-        let chain_uid = typed
-            .chain_uid
-            .clone()
-            // Derived from the plugin name, so it repeats across restarts
-            // and replicas exactly as a configured value would. The chain
-            // itself is per process either way (see `ChainState`); the
-            // uid does not make it survive a restart.
-            .unwrap_or_else(|| format!("ocsf-chain-{}", cfg.name));
+        let chain_uid = typed.chain_uid.clone().unwrap_or_else(|| {
+            // A chain spans one process (see `ChainState`), so the default
+            // names the process: plugin name plus a random component. Two
+            // processes, a restart or a replica, then never mint the same
+            // `<chain_uid>-<seq>` uid from the default. A configured value
+            // is the operator's to keep per process.
+            format!("ocsf-chain-{}-{}", cfg.name, uuid::Uuid::new_v4().simple())
+        });
 
         // The signature covers the chained record (`attestation_list`,
         // AID-EMIT-1 section 4), so `chain: false` has nothing to sign and
@@ -262,11 +265,12 @@ impl OcsfAuditEmitter {
         // set-derived arrays already sorted at build time (ocsf.rs).
         let mut out = event;
 
-        // Held across the whole build: seq allocation, predecessor read
-        // and chain advance must be one atomic step, or two concurrent
-        // invocations can mint the same uid and fork the chain off the
-        // same predecessor. `build` is sync, so there is no await under
-        // the guard. A poisoned lock is recovered rather than propagated:
+        // Held from seq allocation through the chain advance: those must
+        // be one atomic step, or two concurrent invocations can mint the
+        // same uid and fork the chain off the same predecessor. Signing
+        // and the write happen after release. `build` is sync, so there
+        // is no await under the guard. A poisoned lock is recovered
+        // rather than propagated:
         // the state is two plain values and a panic between reading and
         // advancing them cannot leave either half-written.
         let mut guard = self
@@ -311,6 +315,19 @@ impl OcsfAuditEmitter {
 
         let bytes = canonical_bytes(&out);
         let this_fp = fingerprint_value(&bytes);
+
+        // The chain state needs only this record's uid, type and
+        // fingerprint, all known now. Advance it and release the lock
+        // before signing, so one ECDSA operation per record does not
+        // serialize every concurrent request behind the mutex.
+        guard.prev = Some(PrevRef {
+            uid: record_uid,
+            type_uid,
+            fingerprint: this_fp.clone(),
+        });
+        guard.seq += 1;
+        drop(guard);
+
         let signed = self.signer.sign(&bytes);
 
         // Now fill in the two excluded members.
@@ -344,14 +361,6 @@ impl OcsfAuditEmitter {
                 }
             }
         }
-
-        guard.prev = Some(PrevRef {
-            uid: record_uid,
-            type_uid,
-            fingerprint: this_fp,
-        });
-        guard.seq += 1;
-        drop(guard);
 
         out
     }
@@ -758,6 +767,34 @@ mod tests {
             .verifying_key();
         vk.verify(&dsse_pae(&bytes), &sig)
             .expect("emitted signature must verify offline");
+    }
+
+    /// Without a configured `chain_uid`, two emitters (two processes, in
+    /// effect) must not mint the same record uid: the default carries a
+    /// per-process component, so a restart or a replica on the default
+    /// config never collides with its predecessor's `<chain_uid>-000000`.
+    #[test]
+    fn default_chain_uid_is_unique_per_emitter() {
+        let a = OcsfAuditEmitter::new(cfg(json!({ "chain": true }))).unwrap();
+        let b = OcsfAuditEmitter::new(cfg(json!({ "chain": true }))).unwrap();
+        let t = "2026-07-20T12:00:00.000Z";
+        let ev_a = a.build(&tool_payload(), &subject_ext(), t);
+        let ev_b = b.build(&tool_payload(), &subject_ext(), t);
+        assert_ne!(
+            a.chain_uid, b.chain_uid,
+            "default chain_uid must differ per process"
+        );
+        assert!(
+            a.chain_uid.starts_with("ocsf-chain-ocsf-audit-"),
+            "{}",
+            a.chain_uid
+        );
+        assert_ne!(ev_a["metadata"]["uid"], ev_b["metadata"]["uid"]);
+
+        // A configured value is taken verbatim.
+        let c =
+            OcsfAuditEmitter::new(cfg(json!({ "chain": true, "chain_uid": "gw-1-x" }))).unwrap();
+        assert_eq!(c.chain_uid, "gw-1-x");
     }
 
     /// An inline key is consumed by the signer and must not stay printable:

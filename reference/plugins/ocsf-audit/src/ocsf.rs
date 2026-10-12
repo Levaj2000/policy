@@ -611,13 +611,13 @@ pub fn apply_decision(ev: &mut Value, decisions: &DecisionLog) {
 // Helpers: small, content-shape-dependent extractors.
 // ---------------------------------------------------------------------
 
-fn correlation_uid(ext: &Extensions) -> Option<String> {
+fn correlation_uid(ext: &Extensions) -> Option<&str> {
     // correlation_uid must be multi-event-stable, so it mirrors the run
     // id (AgentExtension.conversation_id), not request_id or
     // tool_call_id, which are per-event unique and correlate nothing.
     // Session-grain grouping stays a join on ai_agent.instance_uid
     // (session_id); the run is the primary forensic grain a SIEM keys on.
-    ext.agent.as_ref()?.conversation_id.clone()
+    ext.agent.as_ref()?.conversation_id.as_deref()
 }
 
 fn first_tool_error(payload: &MessagePayload) -> Option<bool> {
@@ -668,12 +668,12 @@ fn attach_capability_coords(ev: &mut Map<String, Value>, payload: &MessagePayloa
 // The following two isolate the less-obvious accessor paths to one place
 // each.
 
-fn security_labels(sec: &praxis_policy_core::extensions::SecurityExtension) -> Vec<String> {
+fn security_labels(sec: &praxis_policy_core::extensions::SecurityExtension) -> Vec<&String> {
     // MonotonicSet<String>::iter() -> impl Iterator<Item = &String>.
     // The backing HashSet iterates in randomized, seed-dependent order;
     // sort so the emitted array is canonical and the fingerprint an
     // independent verifier recomputes matches the emitted one.
-    let mut labels: Vec<String> = sec.labels.iter().cloned().collect();
+    let mut labels: Vec<&String> = sec.labels.iter().collect();
     labels.sort_unstable();
     labels
 }

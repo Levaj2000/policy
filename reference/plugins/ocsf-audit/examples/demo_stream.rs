@@ -240,8 +240,12 @@ fn main() {
     let mut out = stdout.lock();
 
     for (i, case) in cases.iter().enumerate() {
-        let seq = base_seq + u64::try_from(i).expect("case index fits in u64");
-        let ts = format!("2026-08-21T03:20:{i:02}.000Z");
+        let seq = base_seq
+            .checked_add(u64::try_from(i).expect("case index fits in u64"))
+            .expect("DEMO_BASE_SEQ + case index overflows u64");
+        // One second per case from 03:20:00, rolling into the minute so a
+        // long DEMO_CASES list still stamps valid times.
+        let ts = format!("2026-08-21T03:{:02}:{:02}.000Z", 20 + i / 60, i % 60);
 
         let (log, pl, xt) = match case {
             // 1. Clean allow: PDP and PII scan both passed.

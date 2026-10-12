@@ -135,11 +135,12 @@ attestation uids are `<chain_uid>-<seq>` and `<chain_uid>-att-<seq>`. So:
   same uids from `<chain_uid>-000000` up, and a consumer deduplicating by
   `metadata.uid` (AID-EMIT-1 section 6) discards the later records as
   replays;
-- the derived default (`ocsf-chain-<plugin name>`) has the same limit,
-  since it is the same string in every process.
+- the default, `ocsf-chain-<plugin name>-<random>`, is minted per
+  process, so records from different processes never share a uid; the
+  cost is that nothing ties one process's chain to the next.
 
-Give every process its own `chain_uid` and do not share one across
-replicas. A per-process component in the uid, and the vectors it changes,
+A configured `chain_uid` is yours to keep per process: do not share one
+across replicas or reuse one after a restart. A per-process component in the uid, and the vectors it changes,
 is an AID-EMIT-1 revision rather than a change here, since the uid is
 inside the hashed bytes.
 
@@ -156,7 +157,7 @@ never by arrival.
 | `destination` | `stderr` | One JSON object per line to stderr, or `tracing` at target `ocsf.audit`. |
 | `product_name`, `vendor_name` | Praxis Policy Engine OCSF Audit / Praxis | `metadata.product`. |
 | `chain` | `true` | Attach the attestation and declare `record_integrity`. |
-| `chain_uid` | derived from the plugin name | `attestation.chain_uid`. One chain per process; give each process its own value (see [Chain scope](#chain-scope)). |
+| `chain_uid` | plugin name plus a random per-process suffix | `attestation.chain_uid`. One chain per process; a configured value must be unique per process (see [Chain scope](#chain-scope)). |
 | `signing` | `none` | `none` (chained, unsigned) or `dsse`. |
 | `signing_key_pem`, `signing_key_pem_path` | unset | Exactly one, for `signing: dsse`. PKCS#8 P-256; a missing key fails startup rather than emitting unsigned records. The inline key is zeroized and cleared from both config copies once the signer holds it. |
 | `signing_key_id` | unset | JWKS `kid`, stamped at `unmapped.signature_key_id`. |
