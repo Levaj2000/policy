@@ -11,7 +11,7 @@ The record shape is the difference:
 |---|---|---|
 | Output | free-form JSON line | OCSF API Activity event |
 | Verifiability | none | hash chain (`fingerprint` to `prev_event`), DSSE-signed (ECDSA P-256) |
-| Schema | ad hoc | OCSF, so a SIEM ingests it without a bespoke parser |
+| Schema | ad hoc | OCSF API Activity shape, with the [deviations from 1.9.0](#known-deviations-from-ocsf-190) listed below |
 
 The engine produces the decision; this sink makes it portable and verifiable
 offline, without the engine having to own a schema. The record format is
@@ -65,7 +65,8 @@ included, with the executor's finalized `DecisionLog`:
 ```yaml
 engine_settings:
   # Optional. Names the host, so the executor stamps its streams as
-  # gw-1:decision / gw-1:effect. The epoch is deliberately not a YAML value
+  # gw-1:decision / gw-1:effect (this sink renders the decision stream
+  # only; see below). The epoch is deliberately not a YAML value
   # (a static file epoch cannot stay monotonic across boots); a host that
   # supplies one sets engine_settings.audit_epoch in code before load_config.
   audit_stream_namespace: gw-1
@@ -79,6 +80,7 @@ plugins:
       - read_agent
       - read_delegation
       - read_labels
+      - read_workload
     config:
       destination: stderr        # or: tracing
       chain: true                # fingerprint chain, record_integrity profile
@@ -86,19 +88,20 @@ plugins:
       signing_key_pem_path: /etc/praxis/ocsf-signing.pem   # PKCS#8 P-256
       signing_key_id: prod-2026-10         # JWKS kid -> unmapped.signature_key_id
       authority_uid: org-f3576cf6          # the party the signing key belongs to
-      chain_uid: org-f3576cf6              # stable chain id across the deployment
+      chain_uid: gw-1-2026-10-12           # one value per process, never shared by replicas
 ```
 
 **Declare the capabilities.** A sink is filtered on the same terms as any
 other plugin: the engine hands it a view built from its own `plugins:`
 entry. Of the slots this sink maps, `request`, `mcp` and `completion` are
-ungated, but the subject, `agent`, `delegation` and the security labels
-each sit behind a read capability. Omit one and the records still emit,
-still chain and still verify, carrying no `actor`, `ai_agent` or
-`delegation` block and no labels. That is a silent evidence loss rather
-than a load error: a verifier cannot tell "no delegation occurred" from
-"the sink was not permitted to see it". Declare all four unless a
-deployment deliberately withholds one.
+ungated, but the subject, `agent`, `delegation`, the security labels and
+the caller's workload identity each sit behind a read capability. Omit one
+and the records still emit, still chain and still verify, carrying no
+`actor`, `ai_agent` or `delegation` block, no labels, or no
+`cmf.workload_identity`. That is a silent evidence loss rather than a load
+error: a verifier cannot tell "no delegation occurred" from "the sink was
+not permitted to see it". Declare all five unless a deployment
+deliberately withholds one.
 
 **Listing hooks** turns the plugin into a CMF post-hook observer on those
 hooks instead. That path sees allowed traffic only, since a denied request
@@ -112,16 +115,50 @@ the sink wiring: a `PolicyEngine` loading exactly this shape through
 `load_config`, with a plugin that panics, so the record it emits is a real
 fail-closed deny on the host-named stream.
 
+**Decisions only.** The sink implements the decision entry point of
+`AuditHandler` and leaves `on_effect` at its ignoring default, so no
+`EffectRecord`, intent or outcome, token mints included, becomes an OCSF
+event. The `gw-1:effect` stream the executor stamps never reaches this
+sink's output; a deployment that needs it keeps the engine's effect log or
+the `audit-logger` sink beside this one. Rendering effects as
+class-correct OCSF events is a separate change.
+
+## Chain scope
+
+A chain lives for one process. `ChainState` starts at sequence zero with no
+predecessor on every start, nothing is persisted, and the record and
+attestation uids are `<chain_uid>-<seq>` and `<chain_uid>-att-<seq>`. So:
+
+- uids are unique only within one process, and every process start is a
+  new chain whose genesis record has no `prev_event`;
+- two processes sharing a `chain_uid`, a restart or a replica, mint the
+  same uids from `<chain_uid>-000000` up, and a consumer deduplicating by
+  `metadata.uid` (AID-EMIT-1 section 6) discards the later records as
+  replays;
+- the derived default (`ocsf-chain-<plugin name>`) has the same limit,
+  since it is the same string in every process.
+
+Give every process its own `chain_uid` and do not share one across
+replicas. A per-process component in the uid, and the vectors it changes,
+is an AID-EMIT-1 revision rather than a change here, since the uid is
+inside the hashed bytes.
+
+**Ordering.** The chain lock covers sequence allocation, canonicalization
+and signing, and is released before the record is written, so two
+concurrent records can reach the destination in the opposite order from
+their chain positions. Order by `prev_event` (or `cpex.stream.stream_seq`),
+never by arrival.
+
 ## Configuration
 
 | Key | Default | Meaning |
 |---|---|---|
 | `destination` | `stderr` | One JSON object per line to stderr, or `tracing` at target `ocsf.audit`. |
-| `product_name`, `vendor_name` | AI Identity OCSF Audit / AI Identity | `metadata.product`. |
+| `product_name`, `vendor_name` | Praxis Policy Engine OCSF Audit / Praxis | `metadata.product`. |
 | `chain` | `true` | Attach the attestation and declare `record_integrity`. |
-| `chain_uid` | derived from the plugin name | `attestation.chain_uid`. Set it for a chain that survives restarts. |
+| `chain_uid` | derived from the plugin name | `attestation.chain_uid`. One chain per process; give each process its own value (see [Chain scope](#chain-scope)). |
 | `signing` | `none` | `none` (chained, unsigned) or `dsse`. |
-| `signing_key_pem`, `signing_key_pem_path` | unset | Exactly one, for `signing: dsse`. PKCS#8 P-256; a missing key fails startup rather than emitting unsigned records. |
+| `signing_key_pem`, `signing_key_pem_path` | unset | Exactly one, for `signing: dsse`. PKCS#8 P-256; a missing key fails startup rather than emitting unsigned records. The inline key is zeroized and cleared from both config copies once the signer holds it. |
 | `signing_key_id` | unset | JWKS `kid`, stamped at `unmapped.signature_key_id`. |
 | `authority_uid` | unset | The authority the key belongs to. Inside the hashed bytes; set it whenever signing is on. |
 | `include_gap_fields` | `true` | Emit the `cmf.*` fields under `unmapped`. |
@@ -134,8 +171,13 @@ rule, which [`src/sign.rs`](src/sign.rs) implements as `signing_input`:
 1. Remove `attestation_list[0].fingerprint` and `.signatures`.
 2. Remove `unmapped.signature_b64` and `unmapped.signature_key_id`, and
    `unmapped` itself if that leaves it empty.
-3. Serialize per RFC 8785 (sorted keys, compact). The set-derived arrays
-   are already sorted at build time, so the emitted event is canonical.
+3. Serialize per RFC 8785: keys in UTF-16 code-unit order, compact,
+   floats in the ES6 `Number::toString` form (`1.0` is `1`, `1e21` is
+   `1e+21`). The set-derived arrays are already sorted at build time, so
+   the emitted event is canonical. Parse integers exactly rather than
+   through a double: `cpex.stream.epoch` is a nanosecond value past 2^53,
+   which Python's `json` keeps and a plain JavaScript `JSON.parse` does
+   not.
 4. SHA-256 of those bytes is `fingerprint.value`; the DSSE signature
    verifies over `"DSSEv1" SP 31 SP application/vnd.ocsf.event+json SP
    LEN(bytes) SP bytes`.
@@ -149,7 +191,10 @@ Python form.
 ## Examples and conformance vectors
 
 Timestamps, stream stamps and the demo signing key are fixed, so each run
-reproduces its vector byte for byte.
+reproduces its vector byte for byte. The examples print every record
+through `sign::canonical_order`, so the key order matches the vectors under
+the `-p` builds below and under a workspace build, where feature
+unification turns on `serde_json`'s `preserve_order`.
 
 | Example | Vector | Shows |
 |---|---|---|
@@ -169,3 +214,23 @@ cargo run -p praxis-policy-plugin-ocsf-audit --example panic_drive 2>panic.ndjso
 The `emits_required_ocsf_base_fields` test checks structural conformance
 only; validation against the published OCSF schema is not part of this
 crate.
+
+## Known deviations from OCSF 1.9.0
+
+Checked against the 1.9.0 schema files (`events/application/api_activity`,
+`objects/actor`, `objects/user`, `dictionary`). The `ai_agent`, `ai_model`,
+`message_context`, `delegation` and `attestation_list` fields the mapping
+uses are in the schema; these four are not:
+
+| Emitted | Schema |
+|---|---|
+| `time` as an RFC 3339 string | `time` is `timestamp_t`, a millisecond epoch integer; the string form belongs in `time_dt`, which the `datetime` profile adds |
+| `actor.roles` | `actor` has no `roles` member |
+| `actor.user.groups` as strings | `user.groups` is an array of `group` objects |
+| top-level `tool` and `resource` | the class carries `resources` (`resource_details[]`); there is no `tool` |
+
+All four are inside the hashed bytes, so correcting them changes every
+fingerprint and signature. They move together with the per-process uid
+change above, in the next AID-EMIT-1 revision with regenerated vectors.
+Until then a collector that validates against the schema needs to accept
+these four, and a query on `time` must parse the string.

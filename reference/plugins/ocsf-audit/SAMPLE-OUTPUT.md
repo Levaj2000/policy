@@ -56,11 +56,13 @@ Notes on fidelity:
   it. The per-call `tool_call_id` rides at `api.request.uid`. `metadata.uid`
   identifies the record itself, and is what the next record's `prev_event.uid`
   points at.
-- **Key ordering is alphabetical** because the canonical form sorts object keys
-  (`sign::canonical_bytes`, RFC 8785 order), and that is the only ordering a
-  verifier depends on. The printed records happen to match it because
-  `serde_json::Map` is backed by a `BTreeMap` without the `preserve_order`
-  feature; the hashed bytes do not rely on that.
+- **Key ordering is alphabetical** because the example prints each record
+  through `sign::canonical_order`, which re-keys every object in RFC 8785
+  order. That keeps this file reproducible under a `-p` build, where
+  `serde_json::Map` sorts by itself, and under a workspace build, where feature
+  unification turns on `preserve_order` and the map keeps insertion order. The
+  hashed bytes never depend on the printed order: `sign::canonical_bytes` sorts
+  for itself.
 
 ```jsonc
 // ===== OCSF event 1 — Invoke Tool (get_compensation) =====

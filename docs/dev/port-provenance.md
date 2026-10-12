@@ -47,6 +47,25 @@ advanced in between, so the two imports have separate anchors. Only the decision
 point's own paths were selected in the second pass, so nothing else moved with
 it.
 
+## Third import: the OCSF audit sink
+
+| | |
+|---|---|
+| Source repository | `Levaj2000/AI-Identity` |
+| Source commit | `395d64ed8bea695896af1557e530b0065145f593` |
+| Source path | `integrations/cpex-ocsf-audit/` |
+| Placed at | `reference/plugins/ocsf-audit/` |
+| Files imported | 16 |
+
+The sink was brought in as a verbatim copy in one commit, followed by its
+adaptation to this tree's manifest, lint and comment conventions as separate
+commits, so the port is reviewable against the source. No history was
+rewritten or merged: `git log` on these paths starts at the import commit, and
+the source commit above is the anchor for any later comparison. AID-EMIT-1,
+the record format the sink implements, is pinned to the same commit from the
+crate's README and `lib.rs`, and the three `SAMPLE-OUTPUT*.md` files are the
+conformance vectors that commit names.
+
 ## How the import was performed
 
 A fresh clone of the source repository was rewritten with `git-filter-repo`
