@@ -233,11 +233,16 @@ records on either side of the gap still verify on their own. No PPE code is invo
   and an operator-supplied list), and applies the same rule to the open-ended slots (`cmf.mcp`
   annotations and schemas, violation details), where it drops a value or replaces it with a
   keyed digest rather than masking it, since a mask destroys evidence and is still a value a
-  sink might hash. Removal happens before the record exists, so it is inside the hashed bytes
-  and a verifier recomputes what was exported. The engine marks what it removed, inside the
-  record (the dropped names, or a count), so a consumer can tell redacted from never present.
-  A sink decides only how to render what it was given, digests by default (R5); the per-sink
-  raw-argument opt-in of R5 renders what survived R22 and cannot restore what it removed.
+  sink might hash. For tool and prompt arguments the rule is by name: an argument whose name
+  matches a fixed default set (`password`, `passwd`, `secret`, `token`, `api_key`,
+  `authorization`, `credential`, compared case-insensitively, at any depth of the argument
+  object) or a name or JSON path on the operator-supplied list is removed; a value-level rule
+  that looks at content rather than names is not promised here. Removal happens before the
+  record exists, so it is inside the hashed bytes and a verifier recomputes what was exported.
+  The engine marks what it removed, inside the record (the dropped names, or a count), so a
+  consumer can tell redacted from never present. A sink decides only how to render what it
+  was given, digests by default (R5); the per-sink raw-argument opt-in of R5 renders what
+  survived removal and cannot restore what the engine removed.
 
 ## Acceptance Examples
 
@@ -262,9 +267,10 @@ records on either side of the gap still verify on their own. No PPE code is invo
   epoch opens at `stream_seq` 0. Given a reload instead of a restart, the outgoing executor's
   queue drains under its epoch before the new executor's first record is exported.
 - AE6. **Covers R5.** Given `audit-logger` with default settings and a tool call whose
-  arguments contain a value R22 does not remove (an employee id, say), the exported record
-  carries the argument's key and type and not its value. With the opt-in set, it carries the
-  value, and the docs say so. A value R22 removes is AE10's case: no opt-in brings it back.
+  arguments contain a value the engine does not remove (an employee id, say), the exported
+  record carries the argument's key and type and not its value. With the opt-in set, it
+  carries the value, and the docs say so. A value the engine removes stays absent: no opt-in
+  brings it back.
 - AE7. **Covers R6.** Given a sink that declares no `read_agent` capability, the record it
   serializes through the queued path has no agent fields, exactly as the inline path filters
   today.
@@ -276,10 +282,11 @@ records on either side of the gap still verify on their own. No PPE code is invo
   by the key identifier in the record, the standalone validator reports fingerprint, signature,
   chain and stream checks as passing, with no PPE code on the machine.
 - AE10. **Covers R5, R22.** Given a request carrying an `Authorization` header and a tool call
-  whose arguments contain a secret, with `audit-logger` and `ocsf-audit` both attached and both
-  set to the raw-argument opt-in (so the digest default of R5 is not what hides the secret),
-  neither exported record contains the header value or the secret, both carry the removal
-  marker naming the header, and the `ocsf-audit` record still verifies offline.
+  whose arguments include `api_key`, a name on the default removal set, with `audit-logger`
+  and `ocsf-audit` both attached and both set to the raw-argument opt-in (so the digest
+  default of R5 is not what hides the value), neither exported record contains the header
+  value or the `api_key` value, both carry the removal marker naming the header and the
+  argument, and the `ocsf-audit` record still verifies offline.
 
 ## Success Criteria
 
@@ -378,7 +385,8 @@ records on either side of the gap still verify on their own. No PPE code is invo
 - [Affects R20][Technical] Whether the reference plugin resolves its signing key through
   `SecretProvider` directly or through a host-provided key handle, and how the key identifier
   in the record maps to a provider reference.
-- [Affects R22][Technical] The operator-facing shape of the removal list (a fixed set plus an
-  allowlist or denylist of header names and JSON paths), where the removal marker lives (a
-  typed slot or `unmapped`), and whether the open-ended slots are filtered by path or by a
-  value-level rule such as digesting every string above a length.
+- [Affects R22][Technical] The operator-facing shape of the removal list (how the fixed
+  default set and the operator's names and JSON paths are configured, and whether the operator
+  can shrink the default), where the removal marker lives (a typed slot or `unmapped`), and
+  whether a value-level rule such as digesting every string above a length is ever added for
+  the open-ended slots; R22 promises only the by-name rule.
