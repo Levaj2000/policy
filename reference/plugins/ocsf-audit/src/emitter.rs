@@ -57,14 +57,16 @@ struct ChainState {
     prev: Option<PrevRef>,
 }
 
-/// Scrub the inline signing key from both config copies once the signer
-/// owns it. `pem` is the construction-time copy (inline or read from the
-/// path); the typed field and the raw `config:` entry are the two other
-/// holders. `Zeroize` on a `String` overwrites the bytes before the
-/// allocation is freed, and the raw entry is cleared the same way so the
-/// JSON `Value` does not keep a second copy.
-fn redact_inline_key(typed: &mut OcsfAuditConfig, cfg: &mut PluginConfig, mut pem: String) {
-    pem.zeroize();
+/// Scrub the inline signing key from both config copies: the typed field
+/// and the raw `config:` entry. `Zeroize` on a `String` overwrites the
+/// bytes before the allocation is freed, and the raw entry is cleared the
+/// same way so the JSON `Value` does not keep a second copy.
+///
+/// Runs whatever the signing mode is. A key configured alongside
+/// `signing: none`, which is what an operator leaves behind when signing
+/// is turned off for a rotation or an incident, is never consumed by a
+/// signer and would otherwise stay printable for the life of the plugin.
+fn redact_inline_key(typed: &mut OcsfAuditConfig, cfg: &mut PluginConfig) {
     if let Some(mut inline) = typed.signing_key_pem.take() {
         inline.zeroize();
     }
@@ -164,7 +166,7 @@ impl OcsfAuditEmitter {
                 // signing policy while silently lacking the signatures
                 // it promised.
                 let config_err = |message: String| Box::new(PluginError::Config { message });
-                let pem = match (&typed.signing_key_pem, &typed.signing_key_pem_path) {
+                let mut pem = match (&typed.signing_key_pem, &typed.signing_key_pem_path) {
                     (Some(inline), None) => inline.clone(),
                     (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
                         config_err(format!(
@@ -196,16 +198,19 @@ impl OcsfAuditEmitter {
                             cfg.name
                         ))
                     })?;
-                // The signer now holds the key. Everything else that
-                // carries the PEM is config, and config gets printed:
-                // `OcsfAuditConfig` derives `Debug` and `Serialize`, and
-                // `PluginConfig::config` is a `Debug` `Value`. Zeroize the
-                // copies and clear both slots rather than redacting at
-                // each print site. The path form carries no key material.
-                redact_inline_key(&mut typed, &mut cfg, pem);
+                // The signer now holds the key, so the construction-time
+                // copy goes before anything else can read it.
+                pem.zeroize();
                 Box::new(signer)
             },
         };
+
+        // Everything that still carries the PEM is config, and config gets
+        // printed: `OcsfAuditConfig` derives `Debug` and `Serialize`, and
+        // `PluginConfig::config` is a `Debug` `Value`. Zeroize the copies
+        // and clear both slots rather than redacting at each print site.
+        // The path form carries no key material.
+        redact_inline_key(&mut typed, &mut cfg);
 
         Ok(Self {
             cfg,
@@ -828,6 +833,47 @@ mod tests {
         // The path form is untouched and the signer still signs.
         let ev = e.build(&tool_payload(), &subject_ext(), "2026-07-31T12:00:00.000Z");
         assert!(ev["unmapped"]["signature_b64"].is_string());
+    }
+
+    /// A key configured with `signing: none` is never consumed by a signer,
+    /// which is what an operator leaves behind when signing is turned off
+    /// for a rotation. It must be cleared all the same: both config copies
+    /// implement `Debug`, and a key nothing reads is still a key in the
+    /// process image.
+    #[test]
+    fn inline_signing_key_is_cleared_when_signing_is_off() {
+        let e = OcsfAuditEmitter::new(cfg(json!({
+            "chain": true,
+            "signing": "none",
+            "signing_key_pem": test_key_pem(),
+        })))
+        .unwrap();
+        assert!(
+            e.typed.signing_key_pem.is_none(),
+            "typed field must be cleared with signing off too"
+        );
+        assert!(
+            e.cfg
+                .config
+                .as_ref()
+                .unwrap()
+                .get("signing_key_pem")
+                .is_none(),
+            "raw config entry must be removed with signing off too"
+        );
+        for (what, s) in [
+            ("typed", format!("{:?}", e.typed)),
+            ("raw", format!("{:?}", e.cfg.config)),
+        ] {
+            assert!(
+                !s.contains("PRIVATE KEY"),
+                "{what} config still prints the PEM: {s}"
+            );
+        }
+        // Signing is off, so the record chains unsigned.
+        let ev = e.build(&tool_payload(), &subject_ext(), "2026-07-31T12:00:00.000Z");
+        assert!(ev["unmapped"]["signature_b64"].is_null());
+        assert!(ev["attestation_list"][0]["fingerprint"]["value"].is_string());
     }
 
     /// Float bounds in a tool's `inputSchema` and a non-ASCII annotation

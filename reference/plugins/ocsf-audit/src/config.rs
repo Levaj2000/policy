@@ -67,10 +67,11 @@ pub struct OcsfAuditConfig {
     /// tests, demos and secret-manager injection; operators with a key
     /// file should prefer the path form.
     ///
-    /// Consumed at construction: once the signer holds the key, the
-    /// emitter zeroizes and clears this field, and the same entry in the
-    /// raw plugin config, so neither the typed nor the raw config can
-    /// print it through `Debug` or `Serialize`.
+    /// Consumed at construction: the emitter zeroizes and clears this
+    /// field, and the same entry in the raw plugin config, so neither the
+    /// typed nor the raw config can print it through `Debug` or
+    /// `Serialize`. That happens whatever `signing` is set to, so a key
+    /// left behind when signing is turned off does not stay printable.
     #[serde(default)]
     pub signing_key_pem: Option<String>,
 
