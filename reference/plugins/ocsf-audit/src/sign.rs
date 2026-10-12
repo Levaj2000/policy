@@ -30,32 +30,72 @@ use p256::pkcs8::DecodePrivateKey as _;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-/// JCS-style (RFC 8785) canonical serialization of an event.
+/// RFC 8785 (JCS) canonical serialization of an event.
 ///
 /// This is what the fingerprint and the signer consume, so an independent
-/// verifier can recompute the hash from the emitted JSON without
-/// depending on this serializer's internals. Guarantees:
+/// verifier can recompute the hash from the emitted JSON with any RFC 8785
+/// library, without depending on this serializer's internals. The rules:
 ///
-/// * object keys sorted, compact output (no insignificant whitespace),
-///   explicitly rather than via `serde_json`'s default `BTreeMap`-backed
-///   map (a workspace enabling `serde_json`'s `preserve_order` feature
-///   would silently switch that to insertion order);
+/// * object keys sorted by UTF-16 code units (RFC 8785 section 3.2.3),
+///   explicitly rather than via `serde_json`'s map order: a `BTreeMap`
+///   sorts by UTF-8 bytes, which differs for keys outside the BMP, and a
+///   workspace enabling `serde_json`'s `preserve_order` feature would
+///   silently switch to insertion order;
+/// * compact output, no insignificant whitespace;
+/// * strings escaped per section 3.2.2.2, which is `serde_json`'s form:
+///   two-character escapes where one exists, `\u00XX` for the other
+///   control characters, nothing else escaped;
+/// * floats in the ES6 `Number::toString` form of section 3.2.2.3
+///   (`1.0` is `1`, `1e21` is `1e+21`, `1e-7` stays `1e-7`); integers in
+///   their exact decimal digits, which is the same form for every integer
+///   a double represents exactly. Integers beyond 2^53 (the engine's
+///   nanosecond `epoch`, for one) are outside I-JSON's interoperable range,
+///   and a verifier must parse them exactly rather than through a double,
+///   as Python's `json` module does and JavaScript's does not;
 /// * arrays serialized in the order given. Array order is semantic in
 ///   JSON (delegation chain, profiles), so the canonicalizer must not
 ///   sort them; instead, set-derived arrays (security labels, roles,
 ///   teams: `HashSet` / `MonotonicSet`, randomized iteration) are sorted
 ///   at build time in `ocsf.rs`, making the emitted event itself
 ///   canonical.
-///
-/// Caveats against full RFC 8785: keys are sorted by Rust byte order,
-/// which equals the mandated UTF-16 code-unit order for the ASCII key
-/// names emitted; all numbers emitted are integers, where `serde_json`'s
-/// formatting matches the mandated ES6 form. Revisit both if non-ASCII
-/// keys or floats ever enter the event shape.
 pub fn canonical_bytes(v: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     write_canonical(v, &mut out);
     out
+}
+
+/// Rebuild `v` with every object's keys in RFC 8785 order, so a pretty
+/// printer walking the result prints the canonical order.
+///
+/// `serde_json::Map` keeps insertion order only under its `preserve_order`
+/// feature, which a workspace build may turn on through feature
+/// unification; without it the map sorts by UTF-8 bytes. The examples
+/// print through this so their output matches the committed vectors
+/// under either build. The hashed bytes never depend on it:
+/// `canonical_bytes` sorts for itself.
+pub fn canonical_order(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut entries: Vec<(&String, &Value)> = m.iter().collect();
+            entries.sort_unstable_by(|a, b| utf16_order(a.0, b.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), canonical_order(v)))
+                    .collect(),
+            )
+        },
+        Value::Array(a) => Value::Array(a.iter().map(canonical_order).collect()),
+        leaf => leaf.clone(),
+    }
+}
+
+/// RFC 8785 section 3.2.3: property names compare as sequences of UTF-16
+/// code units. Equal to code point order inside the BMP; a supplementary
+/// character (surrogate pair, `0xD800..=0xDFFF`) sorts before `U+E000`
+/// and above, where code point order would put it last.
+fn utf16_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
 }
 
 fn write_canonical(v: &Value, out: &mut Vec<u8>) {
@@ -63,26 +103,11 @@ fn write_canonical(v: &Value, out: &mut Vec<u8>) {
         Value::Object(m) => {
             out.push(b'{');
             let mut entries: Vec<(&String, &Value)> = m.iter().collect();
-            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            entries.sort_unstable_by(|a, b| utf16_order(a.0, b.0));
             for (i, (k, v)) in entries.into_iter().enumerate() {
                 if i > 0 {
                     out.push(b',');
                 }
-                // `fingerprint.serialization_id = 2` (JCS) tells a verifier
-                // to reproduce these bytes with a real RFC 8785 library.
-                // That claim holds only for the value space documented on
-                // `canonical_bytes`: ASCII keys (byte order equals UTF-16
-                // code-unit order) and integer numbers. Assert it rather
-                // than leave it a convention, so the claim cannot go
-                // quietly false if the event shape grows a non-ASCII key.
-                debug_assert!(
-                    k.is_ascii(),
-                    "non-ASCII key {k:?} breaks the JCS (serialization_id 2) claim: \
-                     sort by UTF-16 code units or drop to 99/Other"
-                );
-                // serde_json's string form is RFC 8785 escaping (two-char
-                // escapes for the control characters that have one, \u00XX
-                // otherwise). `Display` on a `Value` is the compact form.
                 // Writing a `&str` into a `Vec` cannot fail.
                 let _ = serde_json::to_writer(&mut *out, k);
                 out.push(b':');
@@ -100,17 +125,82 @@ fn write_canonical(v: &Value, out: &mut Vec<u8>) {
             }
             out.push(b']');
         },
-        // Same reasoning as the key assertion above: serde_json's integer
-        // formatting matches RFC 8785, its float formatting does not.
-        Value::Number(n) => {
-            debug_assert!(
-                n.is_i64() || n.is_u64(),
-                "non-integer number {n} breaks the JCS (serialization_id 2) claim: \
-                 RFC 8785 mandates the ES6 float form"
-            );
-            out.extend_from_slice(n.to_string().as_bytes());
+        Value::Number(n) => match n.as_f64() {
+            // `as_i64` / `as_u64` are `Some` only for numbers parsed or
+            // built as integers; an integral float such as `2.0` takes the
+            // ES6 path and comes out as `2`.
+            Some(f) if n.as_i64().is_none() && n.as_u64().is_none() => write_es6_number(f, out),
+            _ => out.extend_from_slice(n.to_string().as_bytes()),
         },
         leaf => out.extend_from_slice(leaf.to_string().as_bytes()),
+    }
+}
+
+/// ES6 `Number::toString` (ECMA-262 section 7.1.12.1), the number form
+/// RFC 8785 section 3.2.2.3 mandates. Ryu supplies the digits: the
+/// shortest that round-trip, the closest of those to the value, ties to
+/// even, which is the specification's choice of `s` and the one Rust's
+/// `{:e}` departs from on an exact tie. The rest is the placement rule on
+/// `n` (the decimal point's position relative to the digits) and `k` (the
+/// digit count): plain digits up to 21 of them, a decimal point when it
+/// lands inside or just before them, and the exponent form with an
+/// explicit sign past either end.
+fn write_es6_number(f: f64, out: &mut Vec<u8>) {
+    if f == 0.0 {
+        // Both signed zeros print as "0".
+        out.push(b'0');
+        return;
+    }
+    if f < 0.0 {
+        out.push(b'-');
+    }
+    // Ryu prints `ddd.ddd` or `d.ddde±x`; recover the digit string and
+    // `n` from either shape, then drop the zeros that carry no digits.
+    let mut buf = ryu::Buffer::new();
+    let printed = buf.format_finite(f.abs());
+    let (mantissa, exponent) = printed
+        .split_once('e')
+        .map_or((printed, 0), |(m, e)| (m, e.parse::<i64>().unwrap_or(0)));
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).collect();
+    let mut n = i64::try_from(int_part.len())
+        .unwrap_or(i64::MAX)
+        .saturating_add(exponent);
+    let leading = digits.iter().take_while(|b| **b == b'0').count();
+    digits.drain(..leading);
+    n -= i64::try_from(leading).unwrap_or(0);
+    while digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    let k = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+
+    if k <= n && n <= 21 {
+        out.extend_from_slice(&digits);
+        out.extend(std::iter::repeat_n(
+            b'0',
+            usize::try_from(n - k).unwrap_or(0),
+        ));
+    } else if 0 < n && n <= 21 {
+        let (int, frac) = digits.split_at(usize::try_from(n).unwrap_or(0));
+        out.extend_from_slice(int);
+        out.push(b'.');
+        out.extend_from_slice(frac);
+    } else if -6 < n && n <= 0 {
+        out.extend_from_slice(b"0.");
+        out.extend(std::iter::repeat_n(b'0', usize::try_from(-n).unwrap_or(0)));
+        out.extend_from_slice(&digits);
+    } else {
+        if let Some((first, rest)) = digits.split_first() {
+            out.push(*first);
+            if !rest.is_empty() {
+                out.push(b'.');
+                out.extend_from_slice(rest);
+            }
+        }
+        let e = n - 1;
+        out.push(b'e');
+        out.push(if e < 0 { b'-' } else { b'+' });
+        out.extend_from_slice(e.abs().to_string().as_bytes());
     }
 }
 
@@ -329,15 +419,9 @@ mod tests {
 
     /// The emitted `fingerprint.serialization_id = 2` (JCS) is a promise
     /// that a verifier can reproduce these bytes with an off-the-shelf
-    /// RFC 8785 implementation. That promise is true for the value space
-    /// actually emitted (ASCII keys, integer numbers) and this pins the
-    /// two properties a real 8785 library would exercise: keys in
-    /// code-unit order, integers in ES6 form. Floats or non-ASCII keys
-    /// trip the debug assertions in `write_canonical`; if the event shape
-    /// ever needs them, the honest move is `serialization_id` 99 with
-    /// `serialization` naming the scheme.
+    /// RFC 8785 implementation. Integers, ASCII keys: the common case.
     #[test]
-    fn canonical_form_matches_jcs_for_the_value_space_we_emit() {
+    fn canonical_form_matches_jcs_for_integers_and_ascii_keys() {
         let v = json!({
             "b": 10,
             "a": -1,
@@ -347,6 +431,121 @@ mod tests {
         assert_eq!(
             String::from_utf8(canonical_bytes(&v)).unwrap(),
             r#"{"A":0,"a":-1,"b":10,"nested":{"y":"s","z":[1,2]}}"#
+        );
+    }
+
+    /// RFC 8785 section 3.2.2.3: floats print in ES6 `Number::toString`
+    /// form. A float bound in a tool's `inputSchema` is routine MCP
+    /// metadata, and `serde_json`'s own `2.0` / `1e21` would not verify.
+    #[test]
+    fn floats_canonicalize_in_es6_form() {
+        let v = json!({ "minimum": 0.0, "maximum": 2.0, "default": 1.0 });
+        assert_eq!(
+            String::from_utf8(canonical_bytes(&v)).unwrap(),
+            r#"{"default":1,"maximum":2,"minimum":0}"#
+        );
+        assert_eq!(canonical_bytes(&json!({ "x": 1e21 })), br#"{"x":1e+21}"#);
+
+        // Integers keep their exact digits, including past 2^53.
+        assert_eq!(
+            canonical_bytes(&json!([1_755_648_000_000_000_000_u64, -7, 0])),
+            b"[1755648000000000000,-7,0]"
+        );
+    }
+
+    /// RFC 8785 Appendix B number vectors, by IEEE 754 bit pattern, plus
+    /// the placement-rule edges (21 digits, `1e-7`, signed zero).
+    #[test]
+    fn es6_number_form_matches_rfc_8785_appendix_b() {
+        let cases: &[(u64, &str)] = &[
+            (0x0000_0000_0000_0000, "0"),
+            (0x8000_0000_0000_0000, "0"),
+            (0x0000_0000_0000_0001, "5e-324"),
+            (0x7fef_ffff_ffff_ffff, "1.7976931348623157e+308"),
+            (0x4340_0000_0000_0000, "9007199254740992"),
+            (0x4340_0000_0000_0001, "9007199254740994"),
+            (0x444b_1ae4_d6e2_ef50, "1e+21"),
+            (0x3eb0_c6f7_a0b5_ed8d, "0.000001"),
+            (0x3eb0_c6f7_a0b5_ed8c, "9.999999999999997e-7"),
+            (0x41b3_de43_5555_5553, "333333333.3333332"),
+            (0x41b3_de43_5555_5554, "333333333.33333325"),
+            (0x41b3_de43_5555_5555, "333333333.3333333"),
+            (0x41b3_de43_5555_5556, "333333333.3333334"),
+            (0x41b3_de43_5555_5557, "333333333.33333343"),
+            (0xbecb_f647_612f_3696, "-0.0000033333333333333333"),
+            (0x4314_3ff3_c1cb_0959, "1424953923781206.2"),
+        ];
+        for (bits, expected) in cases {
+            let mut out = Vec::new();
+            write_es6_number(f64::from_bits(*bits), &mut out);
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                *expected,
+                "bits {bits:#018x}"
+            );
+        }
+        let edges: &[(f64, &str)] = &[
+            (1e20, "100000000000000000000"),
+            (1e-7, "1e-7"),
+            (4.5, "4.5"),
+            (-1.5, "-1.5"),
+            (1.5e-10, "1.5e-10"),
+            (123.456, "123.456"),
+            (100.0, "100"),
+            (2_f64.powi(63), "9223372036854776000"),
+        ];
+        for (f, expected) in edges {
+            let mut out = Vec::new();
+            write_es6_number(*f, &mut out);
+            assert_eq!(String::from_utf8(out).unwrap(), *expected, "value {f:?}");
+        }
+    }
+
+    /// RFC 8785 section 3.2.3 worked example: keys sort by UTF-16 code
+    /// units, so the smiley (a surrogate pair, `D83D DE02`) precedes the
+    /// Hebrew letter (`FB33`); byte or code point order would put it last.
+    /// `U+0080` stays an unescaped raw character.
+    #[test]
+    fn keys_sort_by_utf16_code_units() {
+        let v = json!({
+            "\u{20ac}": "Euro Sign",
+            "\r": "Carriage Return",
+            "\u{fb33}": "Hebrew Letter Dalet With Dagesh",
+            "1": "One",
+            "\u{1f602}": "Smiley",
+            "\u{80}": "Control",
+            "\u{f6}": "Latin Small Letter O With Diaeresis",
+        });
+        assert_eq!(
+            String::from_utf8(canonical_bytes(&v)).unwrap(),
+            "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\u{80}\":\"Control\",\
+             \"\u{f6}\":\"Latin Small Letter O With Diaeresis\",\"\u{20ac}\":\"Euro Sign\",\
+             \"\u{1f602}\":\"Smiley\",\"\u{fb33}\":\"Hebrew Letter Dalet With Dagesh\"}"
+        );
+        // é (00E9), 😀 (D83D DE00), ﬀ (FB00) in UTF-16 order; byte order
+        // would give é, ﬀ, 😀.
+        assert_eq!(
+            canonical_bytes(&json!({ "ﬀ": 1, "😀": 2, "é": 3 })),
+            "{\"é\":3,\"😀\":2,\"ﬀ\":1}".as_bytes()
+        );
+    }
+
+    /// `canonical_order` is a re-keying, not a re-shaping: the rebuilt
+    /// value equals the original (map equality ignores order) and its
+    /// compact form is the canonical bytes when the map keeps insertion
+    /// order, or byte order otherwise, which agree for ASCII keys.
+    #[test]
+    fn canonical_order_preserves_content() {
+        let v = json!({
+            "z": [{ "b": 1, "a": 2 }, 3],
+            "a": { "y": "b", "x": true },
+        });
+        let ordered = canonical_order(&v);
+        assert_eq!(ordered, v);
+        assert_eq!(
+            serde_json::to_vec(&ordered).unwrap(),
+            canonical_bytes(&v),
+            "ASCII keys: compact print of the re-keyed value is the canonical form"
         );
     }
 

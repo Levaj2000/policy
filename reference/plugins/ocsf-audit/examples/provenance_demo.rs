@@ -58,6 +58,7 @@ use praxis_policy_core::hooks::payload::{ContentKey, PluginPayload as _};
 use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 use praxis_policy_core::secrets::{SecretProviderRegistry, SecretStore, SecretsConfig};
 use praxis_policy_plugin_ocsf_audit::OcsfAuditEmitter;
+use praxis_policy_plugin_ocsf_audit::sign::canonical_order;
 
 /// The deployment key, as an operator would generate it with
 /// `openssl rand -base64 48`. A demo value: it is printed below so the
@@ -325,7 +326,10 @@ async fn main() {
         let ev = e.build_decision(Some(payload), &ext, log, ts);
         println!("// ===== Decision {title} =====");
         println!("// scheme: {}", scheme.name);
-        println!("{}", serde_json::to_string_pretty(&ev).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&canonical_order(&ev)).unwrap()
+        );
         println!();
     }
 

@@ -44,6 +44,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use praxis_policy_plugin_ocsf_audit::OcsfAuditEmitter;
+use praxis_policy_plugin_ocsf_audit::sign::canonical_order;
 
 use praxis_policy_core::cmf::{ContentPart, Message, MessagePayload, Role, ToolCall};
 use praxis_policy_core::decision::{DecisionLog, PluginAction, Span, Verdict};
@@ -301,7 +302,10 @@ fn main() {
     for (title, log, pl, xt, ts) in cases {
         let ev = e.build_decision(Some(pl), xt, log, ts);
         println!("// ===== Decision {title} =====");
-        println!("{}", serde_json::to_string_pretty(&ev).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&canonical_order(&ev)).unwrap()
+        );
         println!();
     }
 

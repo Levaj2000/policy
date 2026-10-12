@@ -4,8 +4,10 @@ extend-exclude = ["Cargo.lock", "target/"]
 [default]
 # W3C trace-context example ids. The OCSF audit sink's examples and vectors
 # stamp their spans with the span id from the trace-context specification,
-# `00f067aa0ba9...`, which the tokenizer splits into a two-letter "word".
-extend-ignore-re = ["00f067aa0ba9[0-9a-f]{4}"]
+# `00f067aa0ba9...`, which the tokenizer splits into a two-letter "word". The
+# examples build it with a format string (`00f067aa0ba9{seq:04}`), so the
+# pattern stops at the fixed prefix.
+extend-ignore-re = ["00f067aa0ba9"]
 
 [default.extend-words]
 # Deliberate misspellings. Each is a fixture for a test that a misspelled
@@ -25,6 +27,7 @@ invocaton = "invocaton"
 mising = "mising"
 requst = "requst"
 strp = "strp"
+authorty = "authorty"
 
 # Alternate spellings that are correct English. typos-cli prefers the other form;
 # this project uses these and is consistent about them.

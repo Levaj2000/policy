@@ -136,6 +136,7 @@ plugins:
       - read_agent
       - read_delegation
       - read_labels
+      - read_workload
 "
     )
 }

@@ -38,10 +38,15 @@ async-trait = { workspace = true }
 base64      = { workspace = true }
 chrono      = { workspace = true }
 p256        = { workspace = true }
+# RFC 8785 float digits; see `sign::canonical_bytes`.
+ryu         = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 sha2        = { workspace = true }
 tracing     = { workspace = true }
+# Scrubs the inline signing key from both config copies once the signer
+# holds it, as the Vault delegator does with its literal secrets.
+zeroize     = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use zeroize::Zeroize as _;
 
 use praxis_policy_core::cmf::{CmfHook, MessagePayload};
 use praxis_policy_core::context::PluginContext;
@@ -41,12 +42,34 @@ struct PrevRef {
     fingerprint: String,
 }
 
+/// The chain's position, held for the life of the emitter and nowhere
+/// else. It starts at sequence zero with no predecessor on every process
+/// start, so a chain spans one process and the uids it mints are unique
+/// only within that process; see `OcsfAuditConfig::chain_uid`.
 #[derive(Default)]
 struct ChainState {
     /// Monotonic per-emitter counter. Drives deterministic record and
     /// attestation uids so example/demo output stays reproducible.
     seq: u64,
     prev: Option<PrevRef>,
+}
+
+/// Scrub the inline signing key from both config copies once the signer
+/// owns it. `pem` is the construction-time copy (inline or read from the
+/// path); the typed field and the raw `config:` entry are the two other
+/// holders. `Zeroize` on a `String` overwrites the bytes before the
+/// allocation is freed, and the raw entry is cleared the same way so the
+/// JSON `Value` does not keep a second copy.
+fn redact_inline_key(typed: &mut OcsfAuditConfig, cfg: &mut PluginConfig, mut pem: String) {
+    pem.zeroize();
+    if let Some(mut inline) = typed.signing_key_pem.take() {
+        inline.zeroize();
+    }
+    if let Some(raw) = cfg.config.as_mut().and_then(Value::as_object_mut)
+        && let Some(Value::String(mut s)) = raw.remove("signing_key_pem")
+    {
+        s.zeroize();
+    }
 }
 
 /// The plugin: one instance per `audit/ocsf` entry, holding the parsed
@@ -93,8 +116,8 @@ impl OcsfAuditEmitter {
     /// A config that does not parse, or `signing: dsse` with no key, both
     /// keys, or a key that cannot be read or parsed. A missing key fails
     /// here rather than falling back to unsigned records.
-    pub fn new(cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
-        let typed: OcsfAuditConfig = match cfg.config.as_ref() {
+    pub fn new(mut cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
+        let mut typed: OcsfAuditConfig = match cfg.config.as_ref() {
             Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
                 Box::new(PluginError::Config {
                     message: format!(
@@ -109,8 +132,10 @@ impl OcsfAuditEmitter {
         let chain_uid = typed
             .chain_uid
             .clone()
-            // Process-lifetime fallback uid. Not random across restarts;
-            // operators who need a stable chain set chain_uid explicitly.
+            // Derived from the plugin name, so it repeats across restarts
+            // and replicas exactly as a configured value would. The chain
+            // itself is per process either way (see `ChainState`); the
+            // uid does not make it survive a restart.
             .unwrap_or_else(|| format!("ocsf-chain-{}", cfg.name));
 
         // The signature covers the chained record (`attestation_list`,
@@ -161,14 +186,21 @@ impl OcsfAuditEmitter {
                         )));
                     },
                 };
-                Box::new(
+                let signer =
                     DsseSigner::from_pem(&pem, typed.signing_key_id.clone()).map_err(|e| {
                         config_err(format!(
                             "plugin '{}' (praxis-policy-plugin-ocsf-audit): {e}",
                             cfg.name
                         ))
-                    })?,
-                )
+                    })?;
+                // The signer now holds the key. Everything else that
+                // carries the PEM is config, and config gets printed:
+                // `OcsfAuditConfig` derives `Debug` and `Serialize`, and
+                // `PluginConfig::config` is a `Debug` `Value`. Zeroize the
+                // copies and clear both slots rather than redacting at
+                // each print site. The path form carries no key material.
+                redact_inline_key(&mut typed, &mut cfg, pem);
+                Box::new(signer)
             },
         };
 
@@ -367,6 +399,11 @@ impl Plugin for OcsfAuditEmitter {
 /// modifications visible to the OCSF stream (a post-hook observer only
 /// ever sees allowed traffic). Awaited on the request path by contract,
 /// so `handle` stays serialize-and-emit cheap.
+///
+/// Only the decision stream is rendered. `on_effect` keeps the trait's
+/// ignoring default: an `EffectRecord` (intent or outcome, token mints
+/// included) has no OCSF rendering here yet, so the `effect` stream never
+/// reaches this sink's output. The README states the limit.
 #[async_trait]
 impl praxis_policy_core::audit::AuditHandler for OcsfAuditEmitter {
     async fn handle(
@@ -723,6 +760,103 @@ mod tests {
             .expect("emitted signature must verify offline");
     }
 
+    /// An inline key is consumed by the signer and must not stay printable:
+    /// neither the typed config nor the raw `config:` entry, both of which
+    /// implement `Debug`, may still carry the PEM, and signing must still
+    /// work from the signer's own copy.
+    #[test]
+    fn inline_signing_key_is_cleared_after_construction() {
+        let e = OcsfAuditEmitter::new(signed_cfg()).unwrap();
+        assert!(
+            e.typed.signing_key_pem.is_none(),
+            "typed field must be cleared"
+        );
+        let typed_debug = format!("{:?}", e.typed);
+        let raw_debug = format!("{:?}", e.cfg.config);
+        for (what, s) in [("typed", &typed_debug), ("raw", &raw_debug)] {
+            assert!(
+                !s.contains("PRIVATE KEY"),
+                "{what} config still prints the PEM: {s}"
+            );
+        }
+        assert!(
+            e.cfg
+                .config
+                .as_ref()
+                .unwrap()
+                .get("signing_key_pem")
+                .is_none(),
+            "raw config entry must be removed"
+        );
+        // The path form is untouched and the signer still signs.
+        let ev = e.build(&tool_payload(), &subject_ext(), "2026-07-31T12:00:00.000Z");
+        assert!(ev["unmapped"]["signature_b64"].is_string());
+    }
+
+    /// Float bounds in a tool's `inputSchema` and a non-ASCII annotation
+    /// key are routine MCP metadata, serialized whole under `cmf.mcp`.
+    /// They must neither panic the canonicalizer nor produce bytes an RFC
+    /// 8785 verifier cannot reproduce: the hashed form carries the ES6
+    /// number form and the signature verifies over it.
+    #[test]
+    fn float_schema_and_non_ascii_annotation_key_verify_offline() {
+        use crate::sign::{dsse_pae, signing_input};
+        use base64::Engine as _;
+        use p256::ecdsa::signature::Verifier as _;
+        use praxis_policy_core::extensions::{MCPExtension, ToolMetadata};
+
+        let mut ext = subject_ext();
+        ext.mcp = Some(Arc::new(MCPExtension {
+            tool: Some(ToolMetadata {
+                name: "get_compensation".into(),
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "ratio": { "type": "number", "minimum": 0.0, "maximum": 2.0, "default": 1.0 },
+                        "big": { "type": "number", "maximum": 1e21 }
+                    }
+                })),
+                annotations: HashMap::from([
+                    ("readOnlyHint".to_owned(), json!(false)),
+                    ("résumé".to_owned(), json!("non-ASCII key")),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+
+        let e = OcsfAuditEmitter::new(signed_cfg()).unwrap();
+        let ev = e.build(&tool_payload(), &ext, "2026-07-31T12:00:00.000Z");
+
+        let bytes = signing_input(&ev);
+        let canonical = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            canonical.contains(r#""default":1,"maximum":2,"minimum":0"#),
+            "floats must take the ES6 form in the hashed bytes: {canonical}"
+        );
+        assert!(canonical.contains(r#""maximum":1e+21"#), "{canonical}");
+        assert!(
+            canonical.contains(r#""résumé":"non-ASCII key""#),
+            "{canonical}"
+        );
+
+        assert_eq!(
+            crate::sign::fingerprint_value(&bytes),
+            ev["attestation_list"][0]["fingerprint"]["value"]
+                .as_str()
+                .unwrap()
+        );
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(ev["unmapped"]["signature_b64"].as_str().unwrap())
+            .unwrap();
+        let sig = p256::ecdsa::Signature::from_der(&der).unwrap();
+        let vk = *p256::ecdsa::SigningKey::from_slice(&[0x11_u8; 32])
+            .unwrap()
+            .verifying_key();
+        vk.verify(&dsse_pae(&bytes), &sig)
+            .expect("signature over the ES6-form bytes must verify");
+    }
+
     /// Signing must merge into `unmapped`, not replace it: the gap fields
     /// (`stop_reason`, mcp, framework, labels, workload) live there and
     /// are part of the hashed evidence.
@@ -767,8 +901,8 @@ mod tests {
     /// policy.
     #[test]
     fn dsse_with_chain_off_fails_construction() {
-        let err = OcsfAuditEmitter::new(cfg(json!({ "signing": "dsse", "chain": false })))
-            .unwrap_err();
+        let err =
+            OcsfAuditEmitter::new(cfg(json!({ "signing": "dsse", "chain": false }))).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("chain: true"), "unexpected error: {msg}");
     }
