@@ -62,7 +62,12 @@
 //! - JSON-RPC parsing of an invalid body, and classifier metadata;
 //! - body size ceilings;
 //! - comma-joining duplicate header lines, and header name and value
-//!   validity on the wire.
+//!   validity on the wire;
+//! - the load-time rejection of `result:` field rules on `prompt:` and
+//!   `resource:` routes (`ensure_supported_entity_results`, in the
+//!   unmirrored `response_rules.rs`): their result projection is blocked on
+//!   praxis-proxy/policy#75 and praxis-proxy/praxis#1330. This driver loads
+//!   such a policy; the real host refuses it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
