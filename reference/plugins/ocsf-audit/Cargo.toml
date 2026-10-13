@@ -43,15 +43,16 @@ ryu         = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 sha2        = { workspace = true }
+# The audit destination runs on blocking workers so a stalled write cannot
+# pin the executor's async audit timeout.
+tokio       = { workspace = true }
 tracing     = { workspace = true }
 # Random per-process component of the default `chain_uid`.
 uuid        = { workspace = true }
-# Scrubs the inline signing key from both config copies once the signer
-# holds it, as the Vault delegator does with its literal secrets.
+# Scrubs the emitter's local inline-key copies in direct-construction demos
+# and tests. The factory rejects inline keys because the engine retains its
+# own config copy.
 zeroize     = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }
 
 [lints]
 workspace = true

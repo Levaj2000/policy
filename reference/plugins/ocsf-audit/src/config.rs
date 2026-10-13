@@ -62,20 +62,21 @@ pub struct OcsfAuditConfig {
     /// `signatures[0].serialization_id = DSSE`; it requires a key via
     /// exactly one of `signing_key_pem` / `signing_key_pem_path`, and a
     /// missing key fails construction loudly rather than silently
-    /// emitting unsigned records.
+    /// emitting unsigned records. Through the factory, use the path form:
+    /// the engine retains its plugin config.
     #[serde(default)]
     pub signing: SigningMode,
 
     /// Inline PKCS#8 P-256 private key PEM for `signing: dsse`.
-    /// Mutually exclusive with `signing_key_pem_path`. Inline is for
-    /// tests, demos and secret-manager injection; operators with a key
-    /// file should prefer the path form.
+    /// Mutually exclusive with `signing_key_pem_path`. Only direct
+    /// `OcsfAuditEmitter::new` callers (tests and demos) may use this:
+    /// `OcsfAuditFactory` rejects it because the engine retains an
+    /// independent, unsanitized copy of its plugin config. Operators must
+    /// use the path form.
     ///
-    /// Consumed at construction: the emitter zeroizes and clears this
-    /// field, and the same entry in the raw plugin config, so neither the
-    /// typed nor the raw config can print it through `Debug` or
-    /// `Serialize`. That happens whatever `signing` is set to, so a key
-    /// left behind when signing is turned off does not stay printable.
+    /// Consumed at direct construction: the emitter zeroizes and clears
+    /// this field and its own raw plugin config, whatever `signing` is set
+    /// to. A caller that kept another config copy must clear that copy.
     #[serde(default)]
     pub signing_key_pem: Option<String>,
 

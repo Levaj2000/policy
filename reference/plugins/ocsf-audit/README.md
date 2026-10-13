@@ -151,6 +151,14 @@ concurrent records can reach the destination in the opposite order from
 their chain positions. Order by `prev_event` (or `aid.stream.stream_seq`),
 never by arrival.
 
+**Stalled output.** The sink awaits each write on the request path, but runs
+the synchronous stderr or tracing destination on a blocking worker. The
+engine's audit timeout can therefore release a request if that destination
+stalls. At most four writes per emitter can remain in flight; later callbacks
+wait for a slot before advancing the chain, and can time out while waiting.
+A timed-out write can still finish later, so consumers must use the chain
+links and stream stamps to detect gaps and order records.
+
 ## Configuration
 
 | Key | Default | Meaning |
@@ -160,7 +168,8 @@ never by arrival.
 | `chain` | `true` | Attach the attestation and declare `record_integrity`. |
 | `chain_uid` | plugin name plus a random per-process suffix | `attestation.chain_uid`. One chain per process; a configured value must be unique per process (see [Chain scope](#chain-scope)). |
 | `signing` | `none` | `none` (chained, unsigned) or `dsse`. |
-| `signing_key_pem`, `signing_key_pem_path` | unset | Exactly one, for `signing: dsse`. PKCS#8 P-256; a missing key fails startup rather than emitting unsigned records. The inline key is zeroized and cleared from both config copies once the signer holds it. |
+| `signing_key_pem_path` | unset | PKCS#8 P-256 key file for `signing: dsse`; a missing key fails startup rather than emitting unsigned records. The factory requires this form because the engine retains its plugin config. |
+| `signing_key_pem` | unset | Only for direct `OcsfAuditEmitter::new` use in tests and demos. The factory rejects inline keys, including when signing is off, because the engine would retain a printable copy in its authoritative config. |
 | `signing_key_id` | unset | JWKS `kid`, stamped at `unmapped.signature_key_id`. |
 | `authority_uid` | unset | The authority the key belongs to. Inside the hashed bytes; set it whenever signing is on. |
 | `include_gap_fields` | `true` | Emit the `cmf.*` fields under `unmapped`. |

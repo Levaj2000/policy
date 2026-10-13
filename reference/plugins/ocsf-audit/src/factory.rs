@@ -29,6 +29,26 @@ pub struct OcsfAuditFactory;
 
 impl PluginFactory for OcsfAuditFactory {
     fn create(&self, config: &PluginConfig) -> Result<PluginInstance, Box<PluginError>> {
+        // The engine retains its authoritative PluginConfig after this
+        // call, independently of the copy held by the emitter. Reject an
+        // inline private key before cloning: redacting the emitter's copy
+        // cannot remove the key from PluginRef::trusted_config or the
+        // engine's policy snapshot.
+        if config
+            .config
+            .as_ref()
+            .and_then(|raw| raw.get("signing_key_pem"))
+            .is_some()
+        {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{}' (praxis-policy-plugin-ocsf-audit): signing_key_pem is not \
+                     accepted through the factory; use signing_key_pem_path so the engine does \
+                     not retain an inline private key",
+                    config.name
+                ),
+            }));
+        }
         let emitter = Arc::new(OcsfAuditEmitter::new(config.clone())?);
 
         // Make the inferred mode explicit in the startup log (as the
@@ -198,5 +218,22 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(msg.contains("requires a key"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn inline_key_is_rejected_before_the_engine_can_retain_it() {
+        for signing in ["none", "dsse"] {
+            let mut config = cfg(vec![]);
+            config.config = Some(serde_json::json!({
+                "signing": signing,
+                "signing_key_pem": "private-key-marker",
+            }));
+            let Err(err) = OcsfAuditFactory.create(&config) else {
+                panic!("an inline key must be rejected even when signing is off");
+            };
+            let message = err.to_string();
+            assert!(message.contains("signing_key_pem_path"), "{message}");
+            assert!(!message.contains("private-key-marker"), "{message}");
+        }
     }
 }

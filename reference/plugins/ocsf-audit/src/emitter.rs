@@ -13,10 +13,11 @@
 
 //! The emitter: builds, chains, signs and writes each record.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroize as _;
 
 use praxis_policy_core::cmf::{CmfHook, MessagePayload};
@@ -85,7 +86,12 @@ pub struct OcsfAuditEmitter {
     chain_uid: String,
     signer: Box<dyn OcsfSigner>,
     chain: Mutex<ChainState>,
+    /// Bounds detached writes if an audit callback times out while its
+    /// blocking destination is still stalled.
+    output_slots: Arc<Semaphore>,
 }
+
+const MAX_PENDING_WRITES: usize = 4;
 
 /// Build a `fingerprint` object around a hex digest.
 ///
@@ -221,6 +227,7 @@ impl OcsfAuditEmitter {
             chain_uid,
             signer,
             chain: Mutex::new(ChainState::default()),
+            output_slots: Arc::new(Semaphore::new(MAX_PENDING_WRITES)),
         })
     }
 
@@ -373,18 +380,51 @@ impl OcsfAuditEmitter {
         out
     }
 
+    /// Reserve a write slot before advancing the chain. Waiting for a slot
+    /// yields to the executor's audit timeout, and a cancelled waiter has
+    /// not minted a chain position for a record it cannot write.
+    async fn output_slot(&self) -> Option<OwnedSemaphorePermit> {
+        match Arc::clone(&self.output_slots).acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(err) => {
+                tracing::error!(plugin = %self.cfg.name, error = %err, "audit output closed");
+                None
+            },
+        }
+    }
+
+    /// Run a synchronous destination on a blocking thread, holding the
+    /// slot until that write actually finishes. A timed-out callback drops
+    /// its join handle, but the still-running write keeps its slot, so a
+    /// stalled destination cannot spawn an unbounded number of threads.
+    async fn write_off_thread(permit: OwnedSemaphorePermit, write: impl FnOnce() + Send + 'static) {
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            write();
+        })
+        .await;
+        if let Err(err) = result {
+            if err.is_panic() {
+                std::panic::resume_unwind(err.into_panic());
+            }
+            tracing::error!(error = %err, "audit output task was cancelled");
+        }
+    }
+
     #[allow(
         clippy::print_stderr,
         reason = "writing the record to stderr is what OcsfDestination::Stderr selects; \
                   the operator asked for this stream by name"
     )]
-    fn emit(&self, event: &Value) {
-        match self.typed.destination {
+    async fn emit(&self, event: Value, permit: OwnedSemaphorePermit) {
+        let destination = self.typed.destination;
+        Self::write_off_thread(permit, move || match destination {
             OcsfDestination::Stderr => eprintln!("{event}"),
             OcsfDestination::Tracing => {
                 tracing::info!(target: "ocsf.audit", event = %event, "ocsf");
             },
-        }
+        })
+        .await;
     }
 }
 
@@ -429,13 +469,16 @@ impl praxis_policy_core::audit::AuditHandler for OcsfAuditEmitter {
         ext: &Extensions,
         decisions: &praxis_policy_core::decision::DecisionLog,
     ) {
+        let Some(permit) = self.output_slot().await else {
+            return;
+        };
         // Downcast to the CMF payload when this dispatch carried one; a
         // non-CMF dispatch (delegation, identity) records without the
         // message-derived fields.
         let msg = payload.as_any().downcast_ref::<MessagePayload>();
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let event = self.build_decision(msg, ext, decisions, &now);
-        self.emit(&event);
+        self.emit(event, permit).await;
     }
 
     fn name(&self) -> &str {
@@ -450,9 +493,12 @@ impl HookHandler<CmfHook> for OcsfAuditEmitter {
         ext: &Extensions,
         _ctx: &mut PluginContext,
     ) -> PluginResult<MessagePayload> {
+        let Some(permit) = self.output_slot().await else {
+            return PluginResult::allow();
+        };
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let event = self.build(payload, ext, &now);
-        self.emit(&event);
+        self.emit(event, permit).await;
         // Observation-only: never block the request.
         PluginResult::allow()
     }
@@ -473,7 +519,6 @@ mod tests {
     use praxis_policy_core::extensions::{SecurityExtension, SubjectExtension};
     use praxis_policy_core::plugin::{OnError, PluginMode};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     fn cfg(extra: serde_json::Value) -> PluginConfig {
         PluginConfig {
@@ -833,7 +878,7 @@ mod tests {
                 .is_none(),
             "raw config entry must be removed"
         );
-        // The path form is untouched and the signer still signs.
+        // The signer still signs after the inline key is cleared.
         let ev = e.build(&tool_payload(), &subject_ext(), "2026-07-31T12:00:00.000Z");
         assert!(ev["unmapped"]["signature_b64"].is_string());
     }
@@ -910,6 +955,42 @@ mod tests {
         let ev = e.build(&tool_payload(), &subject_ext(), "2026-07-31T12:00:00.000Z");
         assert!(ev["unmapped"]["signature_b64"].is_null());
         assert!(ev["attestation_list"][0]["fingerprint"]["value"].is_string());
+    }
+
+    /// The executor wraps this future in `tokio::time::timeout`. A blocked
+    /// destination must yield the runtime thread so that timer can fire;
+    /// otherwise the request waits for the blocking write indefinitely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_output_yields_to_the_audit_timeout() {
+        let emitter = OcsfAuditEmitter::new(cfg(json!({}))).unwrap();
+        let permit = emitter.output_slot().await.unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        // The watchdog makes a synchronous-write regression fail rather
+        // than hang the test indefinitely.
+        let watchdog = std::thread::spawn(move || {
+            let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(1));
+            let _ = release_tx.send(());
+        });
+        let started = std::time::Instant::now();
+        let mut task = tokio::spawn(OcsfAuditEmitter::write_off_thread(permit, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        entered_rx.await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), &mut task).await;
+        let elapsed = started.elapsed();
+        let _ = stop_tx.send(());
+        task.await.unwrap();
+        watchdog.join().unwrap();
+        assert!(result.is_err(), "a blocked write must yield to the timer");
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "the timer did not fire until the blocking write finished"
+        );
     }
 
     /// Float bounds in a tool's `inputSchema` and a non-ASCII annotation

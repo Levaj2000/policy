@@ -330,8 +330,9 @@ impl OcsfSigner for NoopSigner {
 /// DSSE signer: ECDSA-P256-SHA256 over the PAE of the event's canonical
 /// bytes, deterministic per RFC 6979.
 ///
-/// The key is operator-provided (config: `signing_key_pem` inline or
-/// `signing_key_pem_path`); this crate holds a key handle, not a key
+/// The key is operator-provided through `signing_key_pem_path`; direct
+/// emitter construction in tests and demos may use `signing_key_pem`.
+/// This crate holds a key handle, not a key
 /// service. Custody (HSM/KMS residency, rotation epochs, JWKS publication
 /// and its never-unpublish guarantee) is deliberately not plugin scope;
 /// it belongs to whoever operates the signing authority named by
