@@ -25,6 +25,7 @@ members = [
   # why it is not a builtin.
   "reference/plugins/pii-scanner",
   "reference/plugins/audit-logger",
+  "reference/plugins/ocsf-audit",
   # Criterion suite for issue #19. Unpublished; excluded from default-members
   # so everyday `cargo build` stays lean. `cargo bench -p ppe-benches` /
   # `make bench` still pick it up, and `clippy --all-targets` compiles it.
@@ -58,6 +59,7 @@ default-members = [
   # why it is not a builtin.
   "reference/plugins/pii-scanner",
   "reference/plugins/audit-logger",
+  "reference/plugins/ocsf-audit",
 ]
 
 [workspace.package]
@@ -102,7 +104,17 @@ tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive", "rc"] }
 # NOTE: serde_yaml is deprecated; using yaml_serde (yaml.org maintained fork) as drop-in.
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
-serde_json = "1"
+# `float_roundtrip` so a float parses to the double its digits name. The
+# default parser can land one ULP off, which is invisible until something
+# re-serializes: a verifier that re-parses an emitted record and recomputes
+# an RFC 8785 fingerprint (the OCSF audit sink's, for one) then canonicalizes
+# different bytes and reports an untouched record as tampered.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Shortest round-trip float digits with ties broken to even, the ES6
+# `Number::toString` rule RFC 8785 mandates and Rust's own `{:e}` does not
+# follow (it prints `1424953923781206.3` for the Appendix B tie vector). Already
+# in the graph through `serde_json`, so no new crate.
+ryu = "1.0.23"
 async-trait = "0.1"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 moka = { version = "0.12.0", features = ["future"] }
@@ -134,6 +146,10 @@ sha2 = "0.11"
 # Keyed digests: audit content provenance and the OAuth cache key. Moves with
 # `sha2` above, since both have to agree on `digest`.
 hmac = "0.13"
+# ECDSA P-256 for the OCSF audit sink's DSSE signatures. RustCrypto's `ecdsa`
+# signs per RFC 6979, so the same key and bytes always give the same
+# signature, which is what keeps the signed conformance vectors reproducible.
+p256 = { version = "0.14.0", features = ["ecdsa", "pem", "pkcs8"] }
 
 # Internal crates. Single source of truth for each one's path and version
 # requirement; members depend on these with `{ workspace = true }` so a version

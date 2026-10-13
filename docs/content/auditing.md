@@ -94,6 +94,35 @@ plugins:
       source: gateway-eu-1     # optional, stamped on every record
 ```
 
+The reference `ocsf-audit` sink is wired the same way and emits each decision
+as an OCSF API Activity event instead: the verdict as `security_control`, the
+steps, span, taint, content digests and stream stamps under `unmapped`, and
+with `chain: true` an attestation whose fingerprint binds the record to its
+predecessor. A signing key adds a DSSE signature over the same bytes, which a
+verifier checks offline with the public key. It renders decisions only:
+`on_effect` keeps its ignoring default, so effects do not become OCSF events.
+Its README under `reference/plugins/ocsf-audit/` documents the record, the
+verifier rule and the sink's known deviations from the published schema.
+
+```yaml
+plugins:
+  - name: ocsf-audit
+    kind: audit/ocsf
+    mode: audit
+    capabilities:
+      - read_subject
+      - read_agent
+      - read_delegation
+      - read_labels
+      - read_workload
+    config:
+      chain: true
+      signing: dsse
+      signing_key_pem_path: /etc/praxis/ocsf-signing.pem
+      signing_key_id: ocsf-2026-10
+      authority_uid: org-f3576cf6
+```
+
 **A sink declares what it reads, like any other plugin.** The extensions it is
 handed are filtered against its own `capabilities:`, so a sink that declares
 nothing still runs, still emits a record per invocation, and still chains and
