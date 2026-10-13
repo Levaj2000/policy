@@ -53,7 +53,7 @@ Three concerns are fused in `AuditHandler::handle` today, and the fusion is what
   sink gets (inline or queued, and what happens on overflow).
 - **Serializer author.** `audit-logger`, `ocsf-audit`, and any third-party sink. Produces
   records from a `DecisionLog`, the payload's audit view and a filtered `Extensions`, and
-  from an `EffectRecord`. Never performs I/O.
+  from an engine-sanitized effect audit view. Never performs I/O.
 - **Exporter.** Built-in delivery: stderr/stdout, file, Linux audit, later OTLP. Writes bytes
   it does not interpret.
 - **Engine executor.** Finalizes the verdict, stamps the stream fields, hands the record to the
@@ -70,17 +70,21 @@ returns. Guarantee: the exporter returned before the response was sent.
 **F2. Queued delivery.** Verdict is finalized; the executor stamps the stream fields and the
 event time and, in the same step, enqueues an owned `DecisionLog`, an owned copy of the
 payload's audit view for a sink that reads content, and the sink-filtered `Extensions`; the
-executor returns. Effects take the same queue as `EffectRecord`s. One drain task per sink
-dequeues in order, serializes (fingerprint, chain, signature included), batches, and calls the
-exporter. Guarantee: the record was stamped and enqueued before the response was sent, and
-records leave the queue in the order they were stamped.
+executor returns. Effects take the same queue as owned, engine-sanitized effect audit views
+derived from `EffectRecord`s. One drain task per sink dequeues in order, serializes
+(fingerprint, chain, signature included), batches, and calls the exporter. Guarantee: the
+record was stamped and enqueued before the response was sent, and records leave the queue in
+the order they were stamped.
 
 **F3. Overflow.** The queue in front of the drain task is full. The configured policy decides:
 block the request until there is room, or drop the record and count it. Under drop, the
-exported stream shows a `stream_seq` gap exactly where the record was. Behind the drain task,
-when the exporter cannot keep up, the `spill` policy writes the drain task's finished records
+next exported record exposes any missing `stream_seq` values. Drops at the tail require a
+trusted terminal sequence or checkpoint to be visible to an offline consumer. Behind the drain
+task, when the exporter cannot keep up, the `spill` policy writes its finished records
 to disk in order and the exporter catches up from there; a spilled record is already
-serialized, chained and signed, so the disk holds nothing that can still be altered unnoticed.
+serialized, so the disk holds the exact bytes handed to the exporter. Chain links and signatures,
+when the serializer supplies them, are already inside those bytes. An unsigned record has no
+cryptographic tamper detection in the spill buffer.
 
 **F4. Shutdown, reload and restart.** On shutdown the drain tasks are given a bounded deadline
 to empty their queues; whatever is left is counted and reported. A reload is a shutdown of the
@@ -105,13 +109,14 @@ records on either side of the gap still verify on their own. No PPE code is invo
 
 **Serializer (the sink owns the shape)**
 
-- R1. A sink implements a serializer that turns a `DecisionLog`, the payload as it stood at
-  the verdict, and a filtered `Extensions` into one record: owned bytes, a content type, and
-  the stream fields as metadata. Both reference sinks read the payload today (`audit-logger`
-  for tool and prompt fields, `ocsf-audit` for `activity_id` and `type_uid` as well), and a
-  sink that declares no content capability is handed none. The same serializer renders an
-  `EffectRecord` through a second entry point, so the queued path carries effects as well as
-  decisions. The serializer performs no I/O and holds no transport.
+- R1. A sink implements a serializer that turns a `DecisionLog`, the engine-built audit view of
+  the payload at the verdict, and a filtered `Extensions` into one record: owned bytes, a
+  content type, and the stream fields as metadata. Both reference sinks read the payload
+  today: `audit-logger` reads tool and prompt fields, and `ocsf-audit` also derives
+  `activity_id` and `type_uid`. A sink that declares no content capability is handed none.
+  The serializer also renders an engine-sanitized effect audit view through a second entry
+  point, so the queued path carries effects as well as decisions. It performs no I/O and
+  holds no transport.
 - R2. Any integrity material a record carries (fingerprint, chain link, signature) is computed
   by the serializer, inside the record, before the record leaves the serializer. Nothing
   downstream computes, recomputes or adds integrity material.
@@ -190,14 +195,17 @@ records on either side of the gap still verify on their own. No PPE code is invo
   guarantee of each in one sentence apiece (F1 and F2 above).
 - R16. A queued sink has a bounded queue in front of its drain task with one of two overflow
   policies: `block` (the request waits, latency returns under load) or `drop-counted` (the
-  record is dropped, the drop is counted per sink, the stream shows the gap). Behind the drain
-  task, `spill` is the exporter-stage policy: when the exporter falls behind, the drain task's
-  finished records go to an on-disk buffer in `stream_seq` order and the exporter drains them
-  later. Spill holds serialized records, never `DecisionLog`s: a record spilled before
+  record is dropped and counted per sink; a later exported record exposes its missing
+  `stream_seq` value, while a tail drop needs the local counter or a trusted checkpoint).
+  Behind the drain task, `spill` is the exporter-stage policy: when the exporter falls behind,
+  the drain task's finished records go to an on-disk buffer in dequeue order, preserving
+  `stream_seq` within each stream, and the exporter drains them later. Spill holds serialized
+  records, never `DecisionLog`s: a record spilled before
   serialization would be chained by a restarted serializer with no chain state, opening a
   second chain for the old epoch, and anyone who can write the spill directory would get their
-  edits signed on the way out. The policies are explicit in config; there is no silent default
-  beyond `inline`.
+  edits signed on the way out when signing is enabled. Spill preserves the serializer's
+  integrity material but does not make an unsigned record tamper-evident. The policies are
+  explicit in config; there is no silent default beyond `inline`.
 - R17. Shutdown drains every queue with a bounded deadline and reports what did not drain. A
   reload is a shutdown for the outgoing executor (F4): its queues drain under its epoch before
   the new executor exports. A spilled buffer that survives a restart holds finished records
@@ -209,8 +217,8 @@ records on either side of the gap still verify on their own. No PPE code is invo
 
 **Verification contract**
 
-- R19. A record exported by any built-in exporter is verifiable with nothing but its bytes,
-  the authority's public key and the record contract. For `ocsf-audit` that contract is
+- R19. A signed `ocsf-audit` record exported by any built-in exporter is verifiable with
+  nothing but its bytes, the authority's public key and the record contract. That contract is
   AID-EMIT-1 (sections 4, 6, 7 and 11: covered bytes, chain fields, stream stamps, and the
   verification procedure) and the standalone validator that ships with it. No PPE binary or
   source is needed to verify.
@@ -239,10 +247,16 @@ records on either side of the gap still verify on their own. No PPE code is invo
   object) or a name or JSON path on the operator-supplied list is removed; a value-level rule
   that looks at content rather than names is not promised here. Removal happens before the
   record exists, so it is inside the hashed bytes and a verifier recomputes what was exported.
-  The engine marks what it removed, inside the record (the dropped names, or a count), so a
-  consumer can tell redacted from never present. A sink decides only how to render what it
+  The engine adds removed header names and argument or field paths (and optionally a count),
+  never their values, to the sink view. The serializer renders that marker inside the record,
+  so a consumer can tell redacted from never present. A sink decides only how to render what it
   was given, digests by default (R5); the per-sink raw-argument opt-in of R5 renders what
-  survived removal and cannot restore what the engine removed.
+  survived removal and cannot restore what the engine removed. The same rule covers effects:
+  after the write-ahead append, the engine builds a separate sink view of `EffectRecord` without
+  changing the durable record used for reconciliation. Open-ended `details` values are dropped
+  or keyed-digested. Arbitrary `description` and `key` strings are keyed-digested or omitted
+  when no key is configured. `kind` is a non-sensitive classification identifier that plugin
+  authors must not fill with request data. A sink never receives the raw effect values.
 
 ## Acceptance Examples
 
@@ -256,8 +270,9 @@ records on either side of the gap still verify on their own. No PPE code is invo
   every signature verifies offline, and every record's event time lies between the request's
   arrival and the verdict rather than at drain time.
 - AE3. **Covers R8, R16.** Given a queue of depth 64 and the `drop-counted` policy, when the
-  exporter is stalled for the duration of 200 verdicts, the sink's drop counter and the number
-  of `stream_seq` gaps the validator reports are equal, and the records on either side of each
+  exporter is stalled for the duration of 200 verdicts, then resumes and exports a later
+  verdict without another drop or write error, the sink's drop counter equals the number of
+  missing `stream_seq` values before that later verdict, and the records on either side of each
   gap still verify.
 - AE4. **Covers R9.** Given a route that does not resolve and a sink in `queued` delivery, the
   denial is stamped, delivered, and verifies like an allowed verdict.
@@ -287,14 +302,21 @@ records on either side of the gap still verify on their own. No PPE code is invo
   default of R5 is not what hides the value), neither exported record contains the header
   value or the `api_key` value, both carry the removal marker naming the header and the
   argument, and the `ocsf-audit` record still verifies offline.
+- AE11. **Covers R22.** Given an `EffectRecord` whose `description`, `key` and `details` contain
+  sensitive values, with a provenance key configured, both sinks receive only the
+  sanitized effect view and export none of those raw values. The exported record names the
+  removed fields, while the write-ahead effect log retains the original record and key for
+  reconciliation.
 
 ## Success Criteria
 
-- `audit-logger` and `ocsf-audit` both run as serializers behind the same exporter trait, and
-  neither emits a record that differs from what it emitted before the split.
-- The queued path exists, is off by default, and every one of AE1 through AE10 is a named
+- `audit-logger` and `ocsf-audit` both run as serializers behind the same exporter trait.
+  For inputs unaffected by R5 and R22, and with a fixed event time, existing field names,
+  encoding and integrity contracts are preserved. The intentional R5, R7 and R22 changes have
+  updated fixtures and a documented migration note.
+- The queued path exists, is off by default, and every one of AE1 through AE11 is a named
   test or benchmark in the tree.
-- A consumer holding exported bytes from any built-in exporter can verify an `ocsf-audit`
+- A consumer holding exported bytes from any built-in exporter can verify a signed `ocsf-audit`
   record offline against the published contract without reading PPE source.
 - A planner can sequence the exporter trait, the local exporters, the queue, and the
   benchmark without inventing an ordering rule, an overflow semantic, or a framing format.
@@ -324,9 +346,10 @@ records on either side of the gap still verify on their own. No PPE code is invo
   and the enqueue are one step. Parallelism is available across sinks and streams, which is
   where the fan-out is anyway.
 - **Spill after serialization, not before.** The bytes on disk are the bytes a verifier
-  recomputes over, so a spill buffer can neither be altered unnoticed nor needs chain state to
-  resume after a restart. The cost is that spill cannot relieve a drain task that is itself
-  the bottleneck; that case is `block` or `drop-counted`, in the open.
+  receives, and signed records retain their tamper evidence without chain state after a
+  restart. Unsigned records do not gain tamper evidence from spill. The cost is that spill
+  cannot relieve a drain task that is itself the bottleneck; that case is `block` or
+  `drop-counted`, in the open.
 - **Local exporters first.** PPE has no collector stack to lean on, and the operators Teryl and
   Fred asked inside Red Hat all run one already. Local output into an existing collector is
   the shortest path to production and adds no network dependency to the data plane.
@@ -387,6 +410,7 @@ records on either side of the gap still verify on their own. No PPE code is invo
   in the record maps to a provider reference.
 - [Affects R22][Technical] The operator-facing shape of the removal list (how the fixed
   default set and the operator's names and JSON paths are configured, and whether the operator
-  can shrink the default), where the removal marker lives (a typed slot or `unmapped`), and
+  can shrink the default), where the removal marker lives (a typed slot or `unmapped`), how
+  effect fields are represented in the sanitized sink view, and
   whether a value-level rule such as digesting every string above a length is ever added for
   the open-ended slots; R22 promises only the by-name rule.
