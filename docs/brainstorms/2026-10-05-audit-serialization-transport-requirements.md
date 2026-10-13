@@ -109,7 +109,11 @@ shows no leading or interior gap in the exported records. It does not prove the 
 captured: a record lost after the last exported one leaves no gap to see. Tail completeness
 needs a trusted terminal sequence or checkpoint from the host, which this document does not
 define. A gap, or a head above 0, is reported as evidence of loss (R8), not as a verification
-failure: the records on either side of the gap still verify on their own. No PPE code is involved.
+failure: the records on either side of the gap still verify on their own. If the first record
+after a gap names a missing `prev_event`, its fingerprint and signature can verify, but that
+chain link cannot. The verifier reports the unresolved predecessor as loss and resumes chain
+checks between available records. A missing or mismatched predecessor without an explaining
+sequence gap is a chain failure. No PPE code is involved.
 
 ## Requirements
 
@@ -125,7 +129,9 @@ failure: the records on either side of the gap still verify on their own. No PPE
   holds no transport.
 - R2. Any integrity material a record carries (fingerprint, chain link, signature) is computed
   by the serializer, inside the record, before the record leaves the serializer. Nothing
-  downstream computes, recomputes or adds integrity material.
+  downstream computes, recomputes or adds integrity material. On successful serialization,
+  the serializer advances chain state before exporter or spill acknowledgement. Delivery loss
+  does not rewind that state or relink later records.
 - R3. The bytes a serializer emits are the bytes a verifier recomputes over. No exporter,
   batch, queue or spill may re-encode, reorder, pretty-print, truncate, wrap, or otherwise
   alter them. Framing added for delivery (a newline, a length prefix, an OTLP log body) must be
@@ -223,7 +229,9 @@ failure: the records on either side of the gap still verify on their own. No PPE
   write fails, the drain task drops and counts that stamped record without blocking or changing
   the verdict. A later accepted record may reveal its missing sequence number. Tail loss still
   needs a counter or trusted checkpoint. Only complete records are replayable; a partial write
-  is discarded.
+  is discarded. The serializer has already committed the dropped record to its chain state
+  under R2, so the next record may link to a predecessor that was never exported. Verification
+  reports that link as unresolved loss under F5.
   The exporter drains older spilled records before any later record from the same stream,
   never bypassing the backlog after capacity returns. Spill holds serialized records, never
   `DecisionLog`s: a record spilled before serialization would be chained by
@@ -384,10 +392,13 @@ failure: the records on either side of the gap still verify on their own. No PPE
 - AE15. **Covers R16.** Given a full queue under `block`, the wait ends by
   `audit_timeout_milliseconds`; the stamped item is dropped and counted, and the verdict is
   unchanged.
-- AE16. **Covers R14, R16.** Given a spill buffer at its byte limit and an exporter that later
-  recovers, a finished record that cannot fit is dropped and counted, spill occupancy never
-  exceeds the limit, and later records export after older spilled records with the dropped
-  record's `stream_seq` missing. A spill write error follows the same drop rule and is counted.
+- AE16. **Covers R2, R14, R16.** Given a spill buffer at its byte limit, record N is serialized
+  but cannot fit and is dropped and counted. Spill occupancy never exceeds the limit. After
+  the exporter recovers, later records export after older spilled records with N's
+  `stream_seq` missing. Record N+1 retains N's fingerprint as `prev_event`: its own fingerprint
+  and signature verify, while the verifier reports the missing predecessor and sequence as
+  loss. Record N+2 links to N+1 and verifies as a chain segment. A spill write error follows
+  the same drop rule and is counted.
 
 ## Success Criteria
 
