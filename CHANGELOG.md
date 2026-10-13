@@ -139,12 +139,12 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   ([#93](https://github.com/praxis-proxy/policy/issues/93))
 - **Behavior change for hosts parsing JSON through the engine:** floats now
   parse to the double their digits name. `serde_json` is built with
-  `float_roundtrip`, where the default parser can land one ULP away. The
-  difference is invisible until something re-serializes a parsed number: a
-  verifier that re-parsed an emitted audit record and recomputed its RFC 8785
-  fingerprint could arrive at a different hash and report an untouched record
-  as tampered. Values that reach policy as numbers are unaffected in
-  comparison semantics; only the last digit of a round-tripped float moves.
+  `float_roundtrip`, where the default parser can land one ULP away. That
+  corrected value can change a policy result at an exact numeric boundary,
+  although the comparison operators themselves are unchanged. It also changes
+  re-serialization: a verifier that re-parsed an emitted audit record and
+  recomputed its RFC 8785 fingerprint could otherwise report an untouched
+  record as tampered.
   ([#171](https://github.com/praxis-proxy/policy/pull/171))
 
 ### Removed
