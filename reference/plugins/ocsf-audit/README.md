@@ -246,7 +246,7 @@ uses are in the schema; these four are not:
 | top-level `tool` and `resource` | the class carries `resources` (`resource_details[]`); there is no `tool` |
 
 All four are inside the hashed bytes, so correcting them changes every
-fingerprint and signature. They move together with the per-process uid
-change above, in the next AID-EMIT-1 revision with regenerated vectors.
+fingerprint and signature. They move with the deferred change to link chains
+across process starts, in the next AID-EMIT-1 revision with regenerated vectors.
 Until then a collector that validates against the schema needs to accept
 these four, and a query on `time` must parse the string.
