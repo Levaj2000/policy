@@ -83,9 +83,12 @@ count immediately. The verdict is not changed. Under either drop, the next expor
 exposes any missing `stream_seq` values. Drops at the tail require a
 trusted terminal sequence or checkpoint to be visible to an offline consumer. Behind the drain
 task, when the exporter cannot keep up, the `spill` policy writes its finished records
-to disk in order and the exporter catches up from there; a spilled record is already
-serialized, so the disk holds the exact bytes handed to the exporter. Chain links and signatures,
-when the serializer supplies them, are already inside those bytes. An unsigned record has no
+to disk in order, up to a configured byte limit, and the exporter catches up from there.
+If a whole record cannot fit or a spill write fails, the drain task drops and counts it;
+later records retain their sequence numbers and cannot bypass older spilled records.
+A spilled record is already serialized, so the disk holds the exact bytes handed to the
+exporter. Chain links and signatures, when the serializer supplies them, are already inside
+those bytes. An unsigned record has no
 cryptographic tamper detection in the spill buffer.
 
 **F4. Shutdown, reload and restart.** On shutdown the drain tasks have a bounded deadline to
@@ -198,7 +201,8 @@ failure: the records on either side of the gap still verify on their own. No PPE
   slot.
 - R14. Each exporter reports records written, bytes written, write errors and write latency.
   Each sink reports queue depth, records dropped by policy, and records left undelivered at
-  shutdown. It also reports queue-wait expirations and drain-task failures or restarts.
+  shutdown. It also reports queue-wait expirations, drain-task failures or restarts, spill
+  bytes occupied, spill-capacity drops and spill write errors.
 
 **Delivery guarantee (what #165 asks for)**
 
@@ -213,8 +217,16 @@ failure: the records on either side of the gap still verify on their own. No PPE
   a tail drop needs the local counter or a trusted checkpoint.
   Behind the drain task, `spill` is the exporter-stage policy: when the exporter falls behind,
   the drain task's finished records go to an on-disk buffer in dequeue order, preserving
-  `stream_seq` within each stream, and the exporter drains them later. Spill holds serialized
-  records, never `DecisionLog`s: a record spilled before serialization would be chained by
+  `stream_seq` within each stream, and the exporter drains them later. Spill has a finite,
+  configured byte limit for all spill files, including framing and metadata; enabling it
+  without a limit is invalid. If the next whole record exceeds available capacity, or a spill
+  write fails, the drain task drops and counts that stamped record without blocking or changing
+  the verdict. A later accepted record may reveal its missing sequence number. Tail loss still
+  needs a counter or trusted checkpoint. Only complete records are replayable; a partial write
+  is discarded.
+  The exporter drains older spilled records before any later record from the same stream,
+  never bypassing the backlog after capacity returns. Spill holds serialized records, never
+  `DecisionLog`s: a record spilled before serialization would be chained by
   a restarted serializer with no chain state, opening a second chain for the old epoch.
   Anyone who can write the spill directory would get their edits signed on the way out when
   signing is enabled. Spill preserves the serializer's integrity material but does not make
@@ -250,8 +262,9 @@ failure: the records on either side of the gap still verify on their own. No PPE
 
 - R21. The auditing guide documents the serializer and exporter split, the two delivery modes
   and their guarantees, the two queue policies and the spill policy and what each does to the
-  stream, the argument-name-and-type default and raw-value opt-in, the separate optional
-  whole-payload digests, and how a consumer verifies a record offline.
+  stream, including the spill byte limit and full-buffer drops; the argument-name-and-type
+  default and raw-value opt-in; the separate optional whole-payload digests; and how a
+  consumer verifies a record offline.
 
 **Sensitive data (the engine removes, the sink renders)**
 
@@ -371,6 +384,10 @@ failure: the records on either side of the gap still verify on their own. No PPE
 - AE15. **Covers R16.** Given a full queue under `block`, the wait ends by
   `audit_timeout_milliseconds`; the stamped item is dropped and counted, and the verdict is
   unchanged.
+- AE16. **Covers R14, R16.** Given a spill buffer at its byte limit and an exporter that later
+  recovers, a finished record that cannot fit is dropped and counted, spill occupancy never
+  exceeds the limit, and later records export after older spilled records with the dropped
+  record's `stream_seq` missing. A spill write error follows the same drop rule and is counted.
 
 ## Success Criteria
 
@@ -378,7 +395,7 @@ failure: the records on either side of the gap still verify on their own. No PPE
   For inputs unaffected by R5 and R22, and with a fixed event time, existing field names,
   encoding and integrity contracts are preserved. The intentional R5, R7 and R22 changes have
   updated fixtures and a documented migration note.
-- The queued path exists, is off by default, and every one of AE1 through AE15 is a named
+- The queued path exists, is off by default, and every one of AE1 through AE16 is a named
   test or benchmark in the tree.
 - A consumer holding bytes from a built-in exporter can verify a signed `ocsf-audit` record
   offline without PPE source; `tracing` requires a subscriber that preserves or reversibly
@@ -415,7 +432,7 @@ failure: the records on either side of the gap still verify on their own. No PPE
   receives, and signed records retain their tamper evidence without chain state after a
   restart. Unsigned records do not gain tamper evidence from spill. The cost is that spill
   cannot relieve a drain task that is itself the bottleneck; that case is `block` or
-  `drop-counted`, in the open.
+  `drop-counted`, in the open. The bounded spill drops and counts whole records when full.
 - **Local exporters first.** PPE has no collector stack to lean on, and the operators Teryl and
   Fred asked inside Red Hat all run one already. Local output into an existing collector is
   the shortest path to production and adds no network dependency to the data plane.
