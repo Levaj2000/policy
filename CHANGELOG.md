@@ -17,8 +17,13 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-13
+
 ### Added
 
+- Added the opt-in `delegator/vault` builtin to retrieve downstream credentials
+  from Vault KV v2 for a user, client, or workload. Place authorization before
+  delegation in a route. ([#168](https://github.com/praxis-proxy/policy/pull/168))
 - Added integration, resilience, and security test suites that exercise policy
   decisions through the reference host, including dependency failures,
   concurrency, credential leaks, and environment-gated live services.
@@ -40,7 +45,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   use, so a rotation reaches the wire on the next request after a refresh. The
   effective-policy artifact prints the name and never the value, and says that
   no plugin capability reads the slot rather than naming one.
-  ([#93](https://github.com/praxis-proxy/policy/issues/93))
+  ([#93](https://github.com/praxis-proxy/policy/issues/93),
+  [#174](https://github.com/praxis-proxy/policy/pull/174))
 - MCP `annotations` now reach policy as `mcp.tool.annotations.<name>` and the
   same under `mcp.resource` and `mcp.prompt`, flattened through the JSON walker
   that already carries `custom.*`, `framework.metadata.*` and `claim.*`. This
@@ -115,6 +121,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   condition can admit more bytes of non-ASCII text. `exists()` now returns
   `true` when one element matches even if evaluating another element errors,
   so some requests previously denied on that error may now allow.
+  ([#185](https://github.com/praxis-proxy/policy/pull/185))
 - **Breaking:** `HttpExtension` adds `secret_headers`; exhaustive struct
   literals must initialize it (or use `..Default::default()`). Hosts must
   preserve this provenance when carrying HTTP state between hooks. `Debug`
@@ -218,6 +225,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- Defined requirements for audit serialization, delivery, and offline
+  verification. ([#173](https://github.com/praxis-proxy/policy/pull/173))
 - The per-slot key tables in `docs/content/cmf-extensions.md` are now checked
   against the bridge rather than maintained by hand.
   `crates/ppe-apl-cmf/tests/key_catalog/` declares every key the bridge emits
@@ -227,7 +236,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   `capability_namespaces` agrees. The page also now records that `auth_method`
   and `security.classification` are the two keys no capability gates, since
   `filter_extensions` includes them whatever a plugin declared.
-  ([#78](https://github.com/praxis-proxy/policy/issues/78))
+  ([#78](https://github.com/praxis-proxy/policy/issues/78),
+  [#175](https://github.com/praxis-proxy/policy/pull/175))
 - Recorded why `client.teams` is set-only where `subject.teams` also carries
   the flattened `team.<name>` boolean. The flattened form cannot hold a dotted
   name, so it is lossy wherever one occurs while the set always holds every
@@ -237,6 +247,11 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   pins it, because the two loops beside it in `extract_client` do flatten and
   completing the pattern is the obvious wrong edit.
   ([#78](https://github.com/praxis-proxy/policy/issues/78))
+
+### Tests
+
+- Covered authorization on glob and wildcard entity routes, including route
+  specificity. ([#122](https://github.com/praxis-proxy/policy/pull/122))
 
 ## [0.4.1] - 2026-10-05
 
@@ -753,7 +768,8 @@ First release. The engine was extracted from another project rather than written
 
 - **191 lint rules configured across rustc, clippy and rustdoc,** every one at an explicit level. Anything that could silently change an enforcement decision is denied; [`docs/dev/lints.md`](docs/dev/lints.md) explains each group that is not.
 
-[Unreleased]: https://github.com/praxis-proxy/policy/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/praxis-proxy/policy/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/praxis-proxy/policy/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/praxis-proxy/policy/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/praxis-proxy/policy/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/praxis-proxy/policy/compare/v0.3.0...v0.3.1
