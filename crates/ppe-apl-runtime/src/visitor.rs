@@ -746,11 +746,16 @@ impl AplConfigVisitor {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        // A plugin that lists no hooks and attaches as an audit sink is
+        // reached by the executor at every verdict, not from a step, so no
+        // step naming it is what correct wiring looks like. One that lists
+        // hooks is a hook observer instead and must still be named.
         let mut unreached: Vec<&str> = state
             .declared_plugin_hooks
-            .keys()
-            .filter(|name| !state.reached_plugin_names.contains(*name))
-            .map(String::as_str)
+            .iter()
+            .filter(|(name, _)| !state.reached_plugin_names.contains(*name))
+            .filter(|(name, hooks)| !(hooks.is_empty() && is_audit_sink(mgr, name)))
+            .map(|(name, _)| name.as_str())
             .collect();
         if !unreached.is_empty() {
             unreached.sort_unstable();
@@ -1700,6 +1705,12 @@ fn response_subblock(yaml: &serde_yaml::Value, route_key: &str) -> Option<DenyRe
             None
         },
     }
+}
+
+/// Whether `name` is a registered plugin that attaches as an audit sink.
+fn is_audit_sink(mgr: &PolicyEngine, name: &str) -> bool {
+    mgr.get_plugin(name)
+        .is_some_and(|r| Arc::clone(r.plugin()).as_audit_handler().is_some())
 }
 
 #[cfg(test)]

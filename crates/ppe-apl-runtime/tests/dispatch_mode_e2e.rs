@@ -28,10 +28,14 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use praxis_policy_apl_runtime::{AplOptions, register_apl};
+use praxis_policy_core::audit::AuditHandler;
+use praxis_policy_core::decision::DecisionLog;
 use praxis_policy_core::engine::PolicyEngine;
 use praxis_policy_core::error::PluginError;
 use praxis_policy_core::factory::{PluginFactory, PluginInstance};
+use praxis_policy_core::hooks::payload::{Extensions, PluginPayload};
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
 /// A plugin that registers no handler. Every case here is decided at load, so
@@ -57,10 +61,42 @@ impl PluginFactory for InertFactory {
     }
 }
 
-/// An engine with the `builtin` kind wired up, and nothing else.
+/// A plugin that attaches as an audit sink and registers no handler, the
+/// shape of the `audit-logger` and `ocsf-audit` reference sinks with no
+/// `hooks:` listed.
+struct Sink(PluginConfig);
+
+impl Plugin for Sink {
+    fn config(&self) -> &PluginConfig {
+        &self.0
+    }
+
+    fn as_audit_handler(self: Arc<Self>) -> Option<Arc<dyn AuditHandler>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl AuditHandler for Sink {
+    async fn handle(&self, _: &dyn PluginPayload, _: &Extensions, _: &DecisionLog) {}
+}
+
+struct SinkFactory;
+
+impl PluginFactory for SinkFactory {
+    fn create(&self, config: &PluginConfig) -> Result<PluginInstance, Box<PluginError>> {
+        Ok(PluginInstance {
+            plugin: Arc::new(Sink(config.clone())),
+            handlers: Vec::new(),
+        })
+    }
+}
+
+/// An engine with the `builtin` and `sink` kinds wired up, and nothing else.
 fn engine() -> Arc<PolicyEngine> {
     let mgr = Arc::new(PolicyEngine::default());
     mgr.register_factory("builtin", Box::new(InertFactory));
+    mgr.register_factory("sink", Box::new(SinkFactory));
     mgr
 }
 
@@ -348,6 +384,65 @@ plugins:
     hooks: [cmf.tool_pre_invoke]
 ",
     );
+}
+
+/// An audit sink with no `hooks:` is called by the executor at every verdict,
+/// denials included, so no step names it and none should have to. Without
+/// this exemption a policy-dispatch config cannot carry a decision sink.
+#[test]
+fn an_audit_sink_with_no_hooks_needs_no_step() {
+    loads(
+        "
+plugins:
+  - name: ocsf-audit
+    kind: sink
+    mode: audit
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+",
+    );
+}
+
+/// The exemption is for sinks, not for any plugin without hooks: an inert
+/// plugin with none is still stranded.
+#[test]
+fn a_plugin_with_no_hooks_that_is_not_a_sink_is_still_reported() {
+    let e = load_err(
+        "
+plugins:
+  - name: stranded
+    kind: builtin
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+",
+    );
+    assert!(e.contains("stranded"), "the message must name it: {e}");
+}
+
+/// A sink that lists hooks is a hook observer instead, and a hook observer
+/// fires only from a step under policy dispatch, so it must still be named.
+#[test]
+fn a_sink_listing_hooks_is_still_reported() {
+    let e = load_err(
+        "
+plugins:
+  - name: audit-log
+    kind: sink
+    hooks: [cmf.tool_pre_invoke]
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+",
+    );
+    assert!(e.contains("audit-log"), "the message must name it: {e}");
 }
 
 /// A config declaring no plugins has nothing to strand, so the check has
