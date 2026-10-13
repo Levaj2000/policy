@@ -61,9 +61,12 @@ impl PluginFactory for InertFactory {
     }
 }
 
-/// A plugin that attaches as an audit sink and registers no handler, the
-/// shape of the `audit-logger` and `ocsf-audit` reference sinks with no
-/// `hooks:` listed.
+/// A plugin that attaches as an audit sink and registers no handler. It
+/// attaches whatever `hooks:` it lists, which is the engine's own rule
+/// (`PluginRegistry::audit_handlers` reads `as_audit_handler()` and nothing
+/// else) and the shape of an out-of-tree sink. The `audit-logger` and
+/// `ocsf-audit` reference sinks are the narrower case: they attach only
+/// with no `hooks:` listed, and are hook observers otherwise.
 struct Sink(PluginConfig);
 
 impl Plugin for Sink {
@@ -425,11 +428,14 @@ routes:
     assert!(e.contains("stranded"), "the message must name it: {e}");
 }
 
-/// A sink that lists hooks is a hook observer instead, and a hook observer
-/// fires only from a step under policy dispatch, so it must still be named.
+/// The engine attaches a sink on `as_audit_handler()` alone, whatever
+/// `hooks:` it lists, so a sink that lists hooks still runs at every verdict
+/// and the load must not refuse it. The hooks are another matter: under
+/// policy dispatch only a step reaches those, so with no step they are
+/// reported as narrowed, the same as for any plugin.
 #[test]
-fn a_sink_listing_hooks_is_still_reported() {
-    let e = load_err(
+fn a_sink_listing_hooks_loads_and_its_unreached_hooks_are_reported() {
+    let alarms = alarms_raised_by_loading(
         "
 plugins:
   - name: audit-log
@@ -442,7 +448,33 @@ routes:
         - \"require(authenticated)\"
 ",
     );
-    assert!(e.contains("audit-log"), "the message must name it: {e}");
+    assert!(
+        alarms.contains(&NARROWED.to_owned()),
+        "the sink attaches and loads, but no step reaches its hook, so the load \
+         must say so: {alarms:?}"
+    );
+}
+
+/// A disabled sink attaches nowhere: `PluginRegistry::audit_handlers` leaves
+/// it out. With no step naming it either, it is stranded the same as any
+/// unreached plugin, and the load must say so rather than come up with no
+/// sink and no warning.
+#[test]
+fn a_disabled_sink_with_no_hooks_is_still_reported() {
+    let e = load_err(
+        "
+plugins:
+  - name: ocsf-audit
+    kind: sink
+    mode: disabled
+routes:
+  - tool: get_weather
+    authorization:
+      pre_invocation:
+        - \"require(authenticated)\"
+",
+    );
+    assert!(e.contains("ocsf-audit"), "the message must name it: {e}");
 }
 
 /// A config declaring no plugins has nothing to strand, so the check has

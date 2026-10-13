@@ -85,7 +85,7 @@ use praxis_policy_core::config::{
 use praxis_policy_core::engine::PolicyEngine;
 use praxis_policy_core::http_hook::{HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE};
 use praxis_policy_core::identity::HOOK_IDENTITY_RESOLVE;
-use praxis_policy_core::plugin::PluginConfig;
+use praxis_policy_core::plugin::{PluginConfig, PluginMode};
 use praxis_policy_core::visitor::{ConfigVisitor, VisitorError};
 
 use praxis_policy_apl_core::attribute_source::{AttributeSource as _, AttributeTree};
@@ -734,6 +734,10 @@ impl AplConfigVisitor {
     /// Narrowing is a warning, not an error: a plugin declaring three hooks
     /// and named by a step on one may be exactly what was meant. It is
     /// reported because it is equally often not.
+    ///
+    /// An audit sink is the exception to the error: the executor reaches it
+    /// at every verdict without a step. Hooks it lists are still subject to
+    /// the narrowing warning, since only a step reaches those.
     fn report_unreachable_plugins(&self, mgr: &Arc<PolicyEngine>) -> Result<(), VisitorError> {
         // Hook dispatch fires each plugin at the hooks its own `hooks:` names,
         // so a plugin no step reaches is what that mode looks like rather than a
@@ -746,15 +750,17 @@ impl AplConfigVisitor {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // A plugin that lists no hooks and attaches as an audit sink is
-        // reached by the executor at every verdict, not from a step, so no
-        // step naming it is what correct wiring looks like. One that lists
-        // hooks is a hook observer instead and must still be named.
+        // A plugin that attaches as an audit sink is reached by the executor
+        // at every verdict, not from a step, so no step naming it is what
+        // correct wiring looks like. The engine attaches on
+        // `as_audit_handler()` alone, whatever `hooks:` the plugin lists, so
+        // that is the whole test here too: a sink that also lists hooks has
+        // those hooks unreached, which the narrowing report below says.
         let mut unreached: Vec<&str> = state
             .declared_plugin_hooks
             .iter()
             .filter(|(name, _)| !state.reached_plugin_names.contains(*name))
-            .filter(|(name, hooks)| !(hooks.is_empty() && is_audit_sink(mgr, name)))
+            .filter(|(name, _)| !is_audit_sink(mgr, name))
             .map(|(name, _)| name.as_str())
             .collect();
         if !unreached.is_empty() {
@@ -769,9 +775,16 @@ impl AplConfigVisitor {
             .into());
         }
 
+        let none = HashSet::new();
         for (name, declared) in &state.declared_plugin_hooks {
-            let Some(reached) = state.reached_plugin_hooks.get(name) else {
-                continue;
+            let reached = match state.reached_plugin_hooks.get(name) {
+                Some(reached) => reached,
+                // Reached from a layer that records no hook (`global:`), so
+                // coverage is unknown and nothing is said about it.
+                None if state.reached_plugin_names.contains(name) => continue,
+                // Not reached at all, which past the check above is a sink:
+                // every hook it lists is uncovered.
+                None => &none,
             };
             let uncovered: Vec<&str> = declared
                 .iter()
@@ -1707,10 +1720,15 @@ fn response_subblock(yaml: &serde_yaml::Value, route_key: &str) -> Option<DenyRe
     }
 }
 
-/// Whether `name` is a registered plugin that attaches as an audit sink.
+/// Whether `name` is a registered plugin the engine attaches as an audit
+/// sink: it answers `as_audit_handler()` and is not `mode: disabled`, the
+/// two terms `PluginRegistry::audit_handlers` selects on. A disabled sink
+/// attaches nowhere, so it is as stranded as any other unreached plugin.
 fn is_audit_sink(mgr: &PolicyEngine, name: &str) -> bool {
-    mgr.get_plugin(name)
-        .is_some_and(|r| Arc::clone(r.plugin()).as_audit_handler().is_some())
+    mgr.get_plugin(name).is_some_and(|r| {
+        r.trusted_config().mode != PluginMode::Disabled
+            && Arc::clone(r.plugin()).as_audit_handler().is_some()
+    })
 }
 
 #[cfg(test)]
