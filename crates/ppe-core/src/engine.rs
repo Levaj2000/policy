@@ -3855,9 +3855,7 @@ impl PolicyEngine {
         self.load_runtime().registry.get(name)
     }
 
-    /// Whether the plugin registered as `name` attaches as an audit sink,
-    /// by the same rule that selects the sinks the executor calls. See
-    /// [`PluginRegistry::attaches_as_audit_sink`](crate::registry::PluginRegistry::attaches_as_audit_sink).
+    /// Returns whether `name` identifies a registered, enabled audit sink.
     pub fn attaches_as_audit_sink(&self, name: &str) -> bool {
         self.load_runtime().registry.attaches_as_audit_sink(name)
     }

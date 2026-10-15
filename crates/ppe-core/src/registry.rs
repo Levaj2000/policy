@@ -539,10 +539,9 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Whether the plugin registered as `name` is one `audit_handlers`
-    /// collects. Callers that need to know if a plugin is reached as a sink,
-    /// rather than from a hook, ask this instead of restating the rule, so
-    /// the answer cannot drift from what the engine attaches.
+    /// Returns whether `name` identifies a sink included in [`audit_handlers`].
+    ///
+    /// [`audit_handlers`]: Self::audit_handlers
     pub fn attaches_as_audit_sink(&self, name: &str) -> bool {
         self.plugins
             .get(name)
@@ -568,10 +567,7 @@ impl PluginRegistry {
     }
 }
 
-/// The audit handler a registered plugin attaches as, if any: the plugin
-/// opts in through `Plugin::as_audit_handler` and is not `mode: disabled`.
-/// The one place that rule is written; `audit_handlers` and
-/// `attaches_as_audit_sink` both select through it.
+/// Returns the plugin's audit handler unless the plugin is disabled.
 fn attached_audit_handler(r: &PluginRef) -> Option<Arc<dyn crate::audit::AuditHandler>> {
     if r.trusted_config().mode == crate::plugin::PluginMode::Disabled {
         return None;

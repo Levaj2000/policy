@@ -722,26 +722,9 @@ impl AplConfigVisitor {
         }
     }
 
-    /// Fail the load for a declared plugin no policy reaches, and warn for one
-    /// reached on fewer hooks than it declares. Policy dispatch only.
-    ///
-    /// The report is per plugin rather than per config: a config declaring
-    /// three plugins and naming one reaches *something*, and a config-wide
-    /// "reaches nothing" test would pass it while two plugins sit inert. Under
-    /// `dispatch: policy` an unreached plugin never runs, so an operator who
-    /// declared it is looking at a gap in enforcement with nothing to read.
-    ///
-    /// Narrowing is a warning, not an error: a plugin declaring three hooks
-    /// and named by a step on one may be exactly what was meant. It is
-    /// reported because it is equally often not.
-    ///
-    /// An audit sink is the exception to the error: the executor reaches it
-    /// at every verdict without a step. Hooks it lists are still subject to
-    /// the narrowing warning, since only a step reaches those.
+    /// In policy dispatch, reject unreachable plugins and warn about unused hooks.
+    /// Enabled audit sinks need no policy step but remain subject to hook warnings.
     fn report_unreachable_plugins(&self, mgr: &Arc<PolicyEngine>) -> Result<(), VisitorError> {
-        // Hook dispatch fires each plugin at the hooks its own `hooks:` names,
-        // so a plugin no step reaches is what that mode looks like rather than a
-        // fault. Both checks below only mean anything under `policy`.
         if !mgr.dispatch_mode().is_policy() {
             return Ok(());
         }
@@ -750,13 +733,6 @@ impl AplConfigVisitor {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // A plugin that attaches as an audit sink is reached by the executor
-        // at every verdict, not from a step, so no step naming it is what
-        // correct wiring looks like. The engine attaches a sink whatever
-        // `hooks:` it lists, and the registry answers by the rule it attaches
-        // with, so a disabled sink is still reported here. A sink that also
-        // lists hooks has those hooks unreached, which the narrowing report
-        // below says.
         let mut unreached: Vec<&str> = state
             .declared_plugin_hooks
             .iter()
@@ -780,11 +756,8 @@ impl AplConfigVisitor {
         for (name, declared) in &state.declared_plugin_hooks {
             let reached = match state.reached_plugin_hooks.get(name) {
                 Some(reached) => reached,
-                // Reached from a layer that records no hook (`global:`), so
-                // coverage is unknown and nothing is said about it.
+                // `global:` records names without hooks, so coverage is unknown.
                 None if state.reached_plugin_names.contains(name) => continue,
-                // Not reached at all, which past the check above is a sink:
-                // every hook it lists is uncovered.
                 None => &none,
             };
             let uncovered: Vec<&str> = declared

@@ -61,12 +61,7 @@ impl PluginFactory for InertFactory {
     }
 }
 
-/// A plugin that attaches as an audit sink and registers no handler. It
-/// attaches whatever `hooks:` it lists, which is the engine's own rule
-/// (`PluginRegistry::audit_handlers` reads `as_audit_handler()` and nothing
-/// else) and the shape of an out-of-tree sink. The `audit-logger` and
-/// `ocsf-audit` reference sinks are the narrower case: they attach only
-/// with no `hooks:` listed, and are hook observers otherwise.
+/// An audit sink that attaches regardless of its declared hooks.
 struct Sink(PluginConfig);
 
 impl Plugin for Sink {
@@ -95,7 +90,7 @@ impl PluginFactory for SinkFactory {
     }
 }
 
-/// An engine with the `builtin` and `sink` kinds wired up, and nothing else.
+/// An engine with inert plugin and audit sink factories.
 fn engine() -> Arc<PolicyEngine> {
     let mgr = Arc::new(PolicyEngine::default());
     mgr.register_factory("builtin", Box::new(InertFactory));
@@ -389,9 +384,6 @@ plugins:
     );
 }
 
-/// An audit sink with no `hooks:` is called by the executor at every verdict,
-/// denials included, so no step names it and none should have to. Without
-/// this exemption a policy-dispatch config cannot carry a decision sink.
 #[test]
 fn an_audit_sink_with_no_hooks_needs_no_step() {
     loads(
@@ -409,8 +401,6 @@ routes:
     );
 }
 
-/// The exemption is for sinks, not for any plugin without hooks: an inert
-/// plugin with none is still stranded.
 #[test]
 fn a_plugin_with_no_hooks_that_is_not_a_sink_is_still_reported() {
     let e = load_err(
@@ -428,11 +418,6 @@ routes:
     assert!(e.contains("stranded"), "the message must name it: {e}");
 }
 
-/// The engine attaches a sink on `as_audit_handler()` alone, whatever
-/// `hooks:` it lists, so a sink that lists hooks still runs at every verdict
-/// and the load must not refuse it. The hooks are another matter: under
-/// policy dispatch only a step reaches those, so with no step they are
-/// reported as narrowed, the same as for any plugin.
 #[test]
 fn a_sink_listing_hooks_loads_and_its_unreached_hooks_are_reported() {
     let alarms = alarms_raised_by_loading(
@@ -455,10 +440,6 @@ routes:
     );
 }
 
-/// A disabled sink attaches nowhere: `PluginRegistry::audit_handlers` leaves
-/// it out. With no step naming it either, it is stranded the same as any
-/// unreached plugin, and the load must say so rather than come up with no
-/// sink and no warning.
 #[test]
 fn a_disabled_sink_with_no_hooks_is_still_reported() {
     let e = load_err(
