@@ -63,11 +63,12 @@
 //! - body size ceilings;
 //! - comma-joining duplicate header lines, and header name and value
 //!   validity on the wire;
-//! - the load-time rejection of `result:` field rules on `prompt:` and
-//!   `resource:` routes (`ensure_supported_entity_results`, in the
-//!   unmirrored `response_rules.rs`): their result projection is blocked on
-//!   praxis-proxy/policy#75 and praxis-proxy/praxis#1330. This driver loads
-//!   such a policy; the real host refuses it.
+//! - policy validation for `result:` field rules on `prompt:` and
+//!   `resource:` routes. Praxis rejects these rules; this driver accepts them.
+//!
+//! [`PRAXIS_COMMIT`]: PRAXIS_COMMIT
+//! [`MIRRORED`]: MIRRORED
+//! [`Upstream`]: crate::upstream::Upstream
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,9 +110,9 @@ use crate::mcp;
 use crate::secrets::{IssuedTokens, Planted};
 use crate::upstream::{Upstream, UpstreamRequest};
 
-/// The praxis commit the mirrored files were last checked against. The
-/// `host-drift` job in `.github/workflows/integration-live.yml` diffs
-/// [`MIRRORED`] from here to praxis `main`, so keep the full SHA.
+/// The praxis commit used to verify the files in [`MIRRORED`].
+///
+/// [`MIRRORED`]: MIRRORED
 pub const PRAXIS_COMMIT: &str = "dccc6b735cce2de30c00fdf4992e0d27422cd8b5";
 
 /// The praxis files this driver mirrors, relative to the praxis root.
