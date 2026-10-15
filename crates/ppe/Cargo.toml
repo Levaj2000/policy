@@ -164,7 +164,7 @@ hyper-rustls = { version = "0.27", optional = true, default-features = false, fe
 ] }
 # Direct dependencies let the transport select `ring` without reading or setting
 # rustls's process-wide default provider.
-rustls = { version = "0.23", optional = true, default-features = false, features = [
+rustls = { version = "0.23.46", optional = true, default-features = false, features = [
   "ring",
   "tls12",
 ] }
