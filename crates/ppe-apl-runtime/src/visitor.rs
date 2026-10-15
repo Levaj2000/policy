@@ -85,7 +85,7 @@ use praxis_policy_core::config::{
 use praxis_policy_core::engine::PolicyEngine;
 use praxis_policy_core::http_hook::{HOOK_HTTP_REQUEST, HOOK_HTTP_RESPONSE};
 use praxis_policy_core::identity::HOOK_IDENTITY_RESOLVE;
-use praxis_policy_core::plugin::{PluginConfig, PluginMode};
+use praxis_policy_core::plugin::PluginConfig;
 use praxis_policy_core::visitor::{ConfigVisitor, VisitorError};
 
 use praxis_policy_apl_core::attribute_source::{AttributeSource as _, AttributeTree};
@@ -752,15 +752,16 @@ impl AplConfigVisitor {
 
         // A plugin that attaches as an audit sink is reached by the executor
         // at every verdict, not from a step, so no step naming it is what
-        // correct wiring looks like. The engine attaches on
-        // `as_audit_handler()` alone, whatever `hooks:` the plugin lists, so
-        // that is the whole test here too: a sink that also lists hooks has
-        // those hooks unreached, which the narrowing report below says.
+        // correct wiring looks like. The engine attaches a sink whatever
+        // `hooks:` it lists, and the registry answers by the rule it attaches
+        // with, so a disabled sink is still reported here. A sink that also
+        // lists hooks has those hooks unreached, which the narrowing report
+        // below says.
         let mut unreached: Vec<&str> = state
             .declared_plugin_hooks
             .iter()
             .filter(|(name, _)| !state.reached_plugin_names.contains(*name))
-            .filter(|(name, _)| !is_audit_sink(mgr, name))
+            .filter(|(name, _)| !mgr.attaches_as_audit_sink(name))
             .map(|(name, _)| name.as_str())
             .collect();
         if !unreached.is_empty() {
@@ -1718,17 +1719,6 @@ fn response_subblock(yaml: &serde_yaml::Value, route_key: &str) -> Option<DenyRe
             None
         },
     }
-}
-
-/// Whether `name` is a registered plugin the engine attaches as an audit
-/// sink: it answers `as_audit_handler()` and is not `mode: disabled`, the
-/// two terms `PluginRegistry::audit_handlers` selects on. A disabled sink
-/// attaches nowhere, so it is as stranded as any other unreached plugin.
-fn is_audit_sink(mgr: &PolicyEngine, name: &str) -> bool {
-    mgr.get_plugin(name).is_some_and(|r| {
-        r.trusted_config().mode != PluginMode::Disabled
-            && Arc::clone(r.plugin()).as_audit_handler().is_some()
-    })
 }
 
 #[cfg(test)]
