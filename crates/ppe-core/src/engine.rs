@@ -3855,6 +3855,13 @@ impl PolicyEngine {
         self.load_runtime().registry.get(name)
     }
 
+    /// Whether the plugin registered as `name` attaches as an audit sink,
+    /// by the same rule that selects the sinks the executor calls. See
+    /// [`PluginRegistry::attaches_as_audit_sink`](crate::registry::PluginRegistry::attaches_as_audit_sink).
+    pub fn attaches_as_audit_sink(&self, name: &str) -> bool {
+        self.load_runtime().registry.attaches_as_audit_sink(name)
+    }
+
     /// Total number of registered plugins.
     pub fn plugin_count(&self) -> usize {
         self.load_runtime().registry.plugin_count()
