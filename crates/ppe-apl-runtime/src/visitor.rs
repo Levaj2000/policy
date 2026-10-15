@@ -94,6 +94,7 @@ use praxis_policy_apl_core::plugin_decl::{PluginDeclaration, PluginRegistry};
 use praxis_policy_apl_core::rules::{CompiledRoute, DenyResponse, Effect};
 use praxis_policy_apl_core::step::{PdpFactory, PdpResolver};
 
+use crate::decision_cache::{CachedPdpResolver, split_cache_block};
 use crate::dispatch_plan::{DispatchCache, walk_effects};
 use crate::pdp_router::PdpRouter;
 use crate::route_handler::{AplRouteHandler, HookFamily, Phase};
@@ -131,10 +132,9 @@ pub fn hook_pair_for_entity(entity_type: &str) -> Option<(&'static str, &'static
 /// Interior state accumulated as the engine walks the visitor.
 /// `plugin_registry` is populated by `visit_plugins` (called once per
 /// load); the layer fields are populated as the visitor walks
-/// `global` / `defaults` / `policies` / `routes`; `pdp_router` is
-/// populated by both code-supplied resolvers (`register_pdp`) and
-/// unified-config-driven entries under `global.pdp[]` (built
-/// during `visit_global`).
+/// `global` / `defaults` / `policies` / `routes`; `pdp_router` holds
+/// code-supplied resolvers (`register_pdp`) and the config-supplied set
+/// rebuilt from `global.pdp[]` on each `visit_global`.
 #[derive(Default)]
 struct VisitorState {
     plugin_registry: PluginRegistry,
@@ -162,13 +162,17 @@ struct VisitorState {
 /// before calling `load_config_yaml`.
 ///
 /// PDPs come from two sources, both feeding the same internal
-/// [`PdpRouter`]:
+/// [`PdpRouter`], in two layers:
 ///
 /// 1. **Code-supplied** via `register_pdp` (or `AplOptions.pdps`) —
-///    the host built the resolver in code and hands it in.
+///    the host built the resolver in code and hands it in. The first
+///    registration per dialect wins, and a config reload does not
+///    replace it.
 /// 2. **Config-supplied** via `global.pdp[]` blocks in the unified
 ///    config — the visitor sees the block, looks up a factory by
-///    `kind`, and constructs the resolver during `visit_global`.
+///    `kind`, and rebuilds this set during every `visit_global`. A
+///    dialect the new config omits is dropped. A dialect the host
+///    already registered is left on the code layer.
 ///
 /// Factories are registered up front by `kind` name (`"cedar-direct"`,
 /// `"opa"`, …). The visitor knows nothing about specific PDP
@@ -228,11 +232,9 @@ impl AplConfigVisitor {
         }
     }
 
-    /// Register a code-supplied PDP resolver. Equivalent to declaring a
-    /// PDP in the unified config but for hosts that prefer wiring
-    /// resolvers in Rust. Resolvers are pushed into the internal
-    /// `PdpRouter`; the first registration per dialect wins (matches
-    /// `PdpRouter::register` semantics).
+    /// Register a code-supplied PDP resolver. The first registration per
+    /// dialect wins. A later `global.pdp` entry for that dialect is not
+    /// installed, and a config reload does not replace this resolver.
     pub fn register_pdp(&self, resolver: Arc<dyn PdpResolver>) {
         let mut state = self
             .state
@@ -366,9 +368,10 @@ impl AplConfigVisitor {
         self
     }
 
-    /// Parse one entry from `global.pdp[]`. Reads `kind`, dispatches
-    /// to the matching factory, installs the resulting resolver into
-    /// the internal `PdpRouter`. Called per entry during `visit_global`.
+    /// Parse one entry from `global.pdp[]` into a resolver. Does not
+    /// install it: [`Self::install_config_pdps`] swaps the whole
+    /// config-owned set after every entry has built, so one bad entry
+    /// leaves the previous set in place.
     ///
     /// `index` is used only for diagnostics — operators see "the third
     /// pdp entry failed" rather than a generic "a pdp entry failed."
@@ -376,7 +379,7 @@ impl AplConfigVisitor {
         &self,
         entry: &serde_yaml::Value,
         index: usize,
-    ) -> Result<(), VisitorError> {
+    ) -> Result<Arc<dyn PdpResolver>, VisitorError> {
         let map = entry
             .as_mapping()
             .ok_or_else(|| format!("global.pdp[{index}] must be a mapping with a `kind:` field"))?;
@@ -390,14 +393,59 @@ impl AplConfigVisitor {
                  host must call register_pdp_factory(...) before load_config_yaml"
             )
         })?;
+        let (backend_entry, cache_config) = split_cache_block(entry)
+            .map_err(|e| format!("global.pdp[{index}] (kind='{kind}') {e}"))?;
         let resolver = factory
-            .build(entry)
+            .build(&backend_entry)
             .map_err(|e| format!("global.pdp[{index}] (kind='{kind}') failed to build: {e}"))?;
+        let resolver = match cache_config {
+            Some(config) => CachedPdpResolver::wrap(resolver, config, self.engine.clone()),
+            None => resolver,
+        };
+        Ok(resolver)
+    }
+
+    /// Rebuild the config-owned PDP set from this load's `global.pdp[]`.
+    ///
+    /// The map is swapped once, after every entry has built. Duplicate
+    /// dialects keep the first entry. A dialect already registered from
+    /// code is not installed. An empty `entries` drops every config-owned
+    /// resolver and leaves code-supplied ones in place.
+    fn install_config_pdps(&self, entries: &[serde_yaml::Value]) -> Result<(), VisitorError> {
+        let mut built = HashMap::new();
+        for (i, entry) in entries.iter().enumerate() {
+            let resolver = self.build_pdp_from_config(entry, i)?;
+            let dialect = resolver.dialect();
+            if built.contains_key(&dialect) {
+                tracing::warn!(
+                    dialect = ?dialect,
+                    index = i,
+                    "APL visitor: duplicate global.pdp dialect — keeping the first entry",
+                );
+                continue;
+            }
+            let code_owns = {
+                let state = self
+                    .state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.pdp_router.has_code_resolver(&dialect)
+            };
+            if code_owns {
+                tracing::warn!(
+                    dialect = ?dialect,
+                    index = i,
+                    "APL visitor: global.pdp dialect already registered from code — keeping the code-supplied resolver",
+                );
+                continue;
+            }
+            built.insert(dialect, resolver);
+        }
         let mut state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.pdp_router.register(resolver);
+        state.pdp_router.set_config_resolvers(built);
         Ok(())
     }
 
@@ -571,7 +619,6 @@ fn default_base_capabilities() -> std::collections::HashSet<String> {
         "read_labels",
         "read_delegation",
         "read_agent",
-        "read_meta",
     ]
     .iter()
     .map(std::string::ToString::to_string)
@@ -675,22 +722,9 @@ impl AplConfigVisitor {
         }
     }
 
-    /// Fail the load for a declared plugin no policy reaches, and warn for one
-    /// reached on fewer hooks than it declares. Policy dispatch only.
-    ///
-    /// The report is per plugin rather than per config: a config declaring
-    /// three plugins and naming one reaches *something*, and a config-wide
-    /// "reaches nothing" test would pass it while two plugins sit inert. Under
-    /// `dispatch: policy` an unreached plugin never runs, so an operator who
-    /// declared it is looking at a gap in enforcement with nothing to read.
-    ///
-    /// Narrowing is a warning, not an error: a plugin declaring three hooks
-    /// and named by a step on one may be exactly what was meant. It is
-    /// reported because it is equally often not.
+    /// In policy dispatch, reject unreachable plugins and warn about unused hooks.
+    /// Enabled audit sinks need no policy step but remain subject to hook warnings.
     fn report_unreachable_plugins(&self, mgr: &Arc<PolicyEngine>) -> Result<(), VisitorError> {
-        // Hook dispatch fires each plugin at the hooks its own `hooks:` names,
-        // so a plugin no step reaches is what that mode looks like rather than a
-        // fault. Both checks below only mean anything under `policy`.
         if !mgr.dispatch_mode().is_policy() {
             return Ok(());
         }
@@ -701,9 +735,10 @@ impl AplConfigVisitor {
 
         let mut unreached: Vec<&str> = state
             .declared_plugin_hooks
-            .keys()
-            .filter(|name| !state.reached_plugin_names.contains(*name))
-            .map(String::as_str)
+            .iter()
+            .filter(|(name, _)| !state.reached_plugin_names.contains(*name))
+            .filter(|(name, _)| !mgr.attaches_as_audit_sink(name))
+            .map(|(name, _)| name.as_str())
             .collect();
         if !unreached.is_empty() {
             unreached.sort_unstable();
@@ -717,9 +752,13 @@ impl AplConfigVisitor {
             .into());
         }
 
+        let none = HashSet::new();
         for (name, declared) in &state.declared_plugin_hooks {
-            let Some(reached) = state.reached_plugin_hooks.get(name) else {
-                continue;
+            let reached = match state.reached_plugin_hooks.get(name) {
+                Some(reached) => reached,
+                // `global:` records names without hooks, so coverage is unknown.
+                None if state.reached_plugin_names.contains(name) => continue,
+                None => &none,
             };
             let uncovered: Vec<&str> = declared
                 .iter()
@@ -797,6 +836,9 @@ impl ConfigVisitor for AplConfigVisitor {
     ) -> Result<(), VisitorError> {
         self.record_authentication_names(&authentication_step_names(yaml));
         let Some(apl_block) = apl_subblock(yaml) else {
+            // No policy term, so this load declares no PDPs. Drop config-owned
+            // resolvers from the previous load; code-supplied ones stay.
+            self.install_config_pdps(&[])?;
             // No policy term on the section — there is nothing to compile or
             // install. But a bare `global: { response: {...} }` (a denyWith
             // with no accompanying policy) would otherwise be dropped here
@@ -815,11 +857,19 @@ impl ConfigVisitor for AplConfigVisitor {
 
         // Process `global.pdp[]` before stacking the pre/post-invocation
         // layer — route handlers that reference PDPs need them
-        // resolvable by the time `visit_route` runs.
-        if let Some(pdp_entries) = apl_block.get("pdp").and_then(|v| v.as_sequence()) {
-            for (i, entry) in pdp_entries.iter().enumerate() {
-                self.build_pdp_from_config(entry, i)?;
-            }
+        // resolvable by the time `visit_route` runs. Absence of the key
+        // clears config-owned resolvers. A value that is not a list is
+        // an error, same as `global.attribute_files`: skipping it would
+        // leave the previous load's resolvers, including cache wrappers,
+        // answering requests under the new config.
+        match apl_block.get("pdp") {
+            Some(value) => {
+                let entries = value
+                    .as_sequence()
+                    .ok_or_else(|| "global.pdp must be a list".to_owned())?;
+                self.install_config_pdps(entries)?;
+            },
+            None => self.install_config_pdps(&[])?,
         }
 
         // Process an optional `global.session_store` block: swap the
@@ -1668,7 +1718,9 @@ mod tests {
     use praxis_policy_apl_core::evaluator::Decision;
     use praxis_policy_apl_core::pipeline::{FieldRule, Pipeline, Stage, TypeCheck};
     use praxis_policy_apl_core::rules::{CompiledRoute, Effect};
-    use praxis_policy_apl_core::step::{PdpCall, PdpDecision, PdpDialect, PdpError, PdpResolver};
+    use praxis_policy_apl_core::step::{
+        PdpCall, PdpDecision, PdpDialect, PdpError, PdpFactory, PdpResolver,
+    };
     use praxis_policy_core::cmf::enums::Role;
     use praxis_policy_core::cmf::{CmfHook, Message, MessagePayload};
     use praxis_policy_core::config::{HttpSelector, Pattern, StringOrList};
@@ -2493,6 +2545,276 @@ routes:
             allowed.continue_processing,
             "the route's rule is the route's alone; violation = {:?}",
             allowed.violation
+        );
+    }
+
+    struct LabeledPdp {
+        dialect: PdpDialect,
+        label: String,
+    }
+
+    #[async_trait::async_trait]
+    impl PdpResolver for LabeledPdp {
+        fn dialect(&self) -> PdpDialect {
+            self.dialect.clone()
+        }
+
+        async fn evaluate(
+            &self,
+            _call: &PdpCall,
+            _bag: &AttributeBag,
+        ) -> Result<PdpDecision, PdpError> {
+            Ok(PdpDecision {
+                decision: Decision::Deny {
+                    reason: Some(self.label.clone()),
+                    rule_source: "test".to_owned(),
+                },
+                diagnostics: Vec::new(),
+            })
+        }
+    }
+
+    struct LabeledFactory {
+        kind: &'static str,
+        dialect: PdpDialect,
+    }
+
+    impl PdpFactory for LabeledFactory {
+        fn kind(&self) -> &str {
+            self.kind
+        }
+
+        fn build(
+            &self,
+            config: &serde_yaml::Value,
+        ) -> Result<Arc<dyn PdpResolver>, Box<dyn std::error::Error + Send + Sync>> {
+            let label = config
+                .get("label")
+                .and_then(serde_yaml::Value::as_str)
+                .ok_or("labeled factory requires `label`")?
+                .to_owned();
+            Ok(Arc::new(LabeledPdp {
+                dialect: self.dialect.clone(),
+                label,
+            }))
+        }
+    }
+
+    async fn resolver_label(
+        visitor: &AplConfigVisitor,
+        dialect: PdpDialect,
+    ) -> Result<String, PdpError> {
+        let router = {
+            let state = visitor
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.pdp_router.clone()
+        };
+        let decision = router
+            .evaluate(
+                &PdpCall {
+                    dialect,
+                    args: serde_yaml::Value::Null,
+                },
+                &AttributeBag::default(),
+            )
+            .await?
+            .decision;
+        match decision {
+            Decision::Deny { reason, .. } => Ok(reason.expect("label")),
+            Decision::Allow => panic!("labeled resolvers deny"),
+        }
+    }
+
+    /// Code-supplied resolvers stay across reloads. Config-owned ones are
+    /// rebuilt as a set: a duplicate keeps the first entry, a removed dialect
+    /// is gone, and dropping the policy block clears the config layer.
+    #[tokio::test]
+    async fn config_pdps_reload_without_replacing_a_code_supplied_resolver() {
+        let engine = Arc::new(PolicyEngine::default());
+        let mut visitor = AplConfigVisitor::new(
+            Arc::new(DispatchCache::new()),
+            Arc::new(MemorySessionStore::new()),
+            Arc::downgrade(&engine),
+        );
+        visitor.register_pdp_factory(Arc::new(LabeledFactory {
+            kind: "marked",
+            dialect: PdpDialect::Cedar,
+        }));
+        visitor.register_pdp_factory(Arc::new(LabeledFactory {
+            kind: "other",
+            dialect: PdpDialect::Opa,
+        }));
+        visitor.register_pdp(Arc::new(LabeledPdp {
+            dialect: PdpDialect::Cedar,
+            label: "from-code".to_owned(),
+        }));
+
+        visitor
+            .visit_global(
+                &engine,
+                &yaml(
+                    "pdp:\n  - kind: marked\n    label: from-config\n  - kind: other\n    label: opa-a\n  - kind: other\n    label: opa-b\n",
+                ),
+            )
+            .expect("first load");
+        assert_eq!(
+            resolver_label(&visitor, PdpDialect::Cedar).await.unwrap(),
+            "from-code"
+        );
+        assert_eq!(
+            resolver_label(&visitor, PdpDialect::Opa).await.unwrap(),
+            "opa-a",
+            "duplicate config entries keep the first"
+        );
+
+        visitor
+            .visit_global(&engine, &yaml("pdp:\n  - kind: other\n    label: opa-c\n"))
+            .expect("reload");
+        assert_eq!(
+            resolver_label(&visitor, PdpDialect::Cedar).await.unwrap(),
+            "from-code",
+            "reload must not replace the code-supplied resolver"
+        );
+        assert_eq!(
+            resolver_label(&visitor, PdpDialect::Opa).await.unwrap(),
+            "opa-c"
+        );
+
+        visitor
+            .visit_global(&engine, &yaml("attribute_files: []\n"))
+            .expect("a policy block with no pdp key clears config resolvers");
+        assert_eq!(
+            resolver_label(&visitor, PdpDialect::Cedar).await.unwrap(),
+            "from-code"
+        );
+        let missing = resolver_label(&visitor, PdpDialect::Opa)
+            .await
+            .expect_err("opa was removed with the pdp key");
+        assert!(matches!(missing, PdpError::NoResolver(_)));
+
+        visitor
+            .visit_global(&engine, &yaml("pdp:\n  - kind: other\n    label: opa-d\n"))
+            .expect("config layer can be installed again");
+        assert_eq!(
+            resolver_label(&visitor, PdpDialect::Opa).await.unwrap(),
+            "opa-d"
+        );
+
+        visitor
+            .visit_global(&engine, &serde_yaml::Value::Null)
+            .expect("no policy block");
+        let missing = resolver_label(&visitor, PdpDialect::Opa)
+            .await
+            .expect_err("dropping the policy block drops config resolvers");
+        assert!(matches!(missing, PdpError::NoResolver(_)));
+        assert_eq!(
+            resolver_label(&visitor, PdpDialect::Cedar).await.unwrap(),
+            "from-code"
+        );
+    }
+
+    #[derive(Default)]
+    struct SecretHeaderPdp {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PdpResolver for SecretHeaderPdp {
+        fn dialect(&self) -> PdpDialect {
+            PdpDialect::Cel
+        }
+
+        async fn evaluate(
+            &self,
+            _call: &PdpCall,
+            bag: &AttributeBag,
+        ) -> Result<PdpDecision, PdpError> {
+            assert_eq!(
+                bag.get_string("http.request_headers.x-api-key"),
+                Some("<redacted secret.key>")
+            );
+            assert_eq!(
+                bag.get_string("http.request_headers.x-client"),
+                Some("visible")
+            );
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(PdpDecision {
+                decision: Decision::Allow,
+                diagnostics: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn response_pdp_cannot_read_an_asserted_secret() {
+        use praxis_policy_core::secrets::SecretProviderRegistry;
+        let file = std::env::temp_dir().join(format!(
+            "ppe-apl-secret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&file, "test-credential").unwrap();
+        let mgr = Arc::new(PolicyEngine::default());
+        mgr.set_secret_providers(SecretProviderRegistry::with_builtin_backends());
+        let pdp = Arc::new(SecretHeaderPdp::default());
+        let mut options = crate::AplOptions::in_process();
+        options.pdps.push(pdp.clone());
+        crate::register_apl(&mgr, options);
+        mgr.load_config_yaml(&format!(
+            "
+engine_settings:
+  dispatch: policy
+secrets:
+  providers:
+    local: {{ kind: file }}
+  values:
+    key: {{ provider: local, ref: {} }}
+routes:
+  - http: /tool
+    assertions:
+      request:
+        headers:
+          - name: X-API-Key
+            from: secret.key
+    authorization:
+      post_invocation:
+        - cel: {{ expr: 'true' }}
+",
+            file.display()
+        ))
+        .unwrap();
+        mgr.initialize().await.unwrap();
+        std::fs::remove_file(file).unwrap();
+        let mut ext = http_request("POST", Some("/tool"));
+        Arc::make_mut(ext.http.as_mut().unwrap()).set_request_header("x-client", "visible");
+        let (request, _) = mgr
+            .invoke_named::<HttpHook>(HOOK_HTTP_REQUEST, HttpPayload, ext, None)
+            .await;
+        assert!(request.continue_processing);
+        let (response, _) = mgr
+            .invoke_named::<HttpHook>(
+                HOOK_HTTP_RESPONSE,
+                HttpPayload,
+                request.modified_extensions.unwrap(),
+                None,
+            )
+            .await;
+        assert!(response.continue_processing, "{:?}", response.violation);
+        assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            response
+                .modified_extensions
+                .unwrap()
+                .http
+                .unwrap()
+                .get_request_header("x-api-key"),
+            Some("test-credential")
         );
     }
 

@@ -40,7 +40,11 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  test              Run all workspace tests"
+	@echo "  test-integration  Integration, resilience and security suites"
+	@echo "  test-resilience   Resilience suite (dependency failure, concurrency)"
+	@echo "  test-security     Security suite (adversarial inputs)"
 	@echo "  test-tsan         Engine concurrency stress under ThreadSanitizer (nightly)"
+	@echo "  bench-pdp-cache   PDP decision-cache hit vs miss (on demand, not CI)"
 	@echo ""
 	@echo "Benchmarks (on demand — not part of make ci; see docs/dev/benchmarks.md):"
 	@echo "  bench             Criterion suite (ppe-benches / issue #19)"
@@ -174,6 +178,24 @@ test:
 	@$(CARGO) test --workspace
 	@$(CARGO) test --workspace --all-features
 
+# The suites under tests/. They build only with `--all-features`, which turns on
+# their `suite` feature; `make test` runs them in its second pass. As in praxis,
+# test-integration runs all three.
+.PHONY: test-integration
+test-integration:
+	@$(CARGO) test --all-features \
+		-p praxis-policy-tests-integration \
+		-p praxis-policy-tests-resilience \
+		-p praxis-policy-tests-security
+
+.PHONY: test-resilience
+test-resilience:
+	@$(CARGO) test --all-features -p praxis-policy-tests-resilience
+
+.PHONY: test-security
+test-security:
+	@$(CARGO) test --all-features -p praxis-policy-tests-security
+
 # ThreadSanitizer on the engine concurrency stress test. Needs nightly, a
 # Linux target, and an instrumented libstd (`-Zbuild-std`). The sanitizer
 # does not run on the pinned stable toolchain or on macOS. `--test-threads=1`
@@ -186,6 +208,12 @@ test-tsan:
 		-p praxis-policy-core --test engine_concurrency \
 		--target x86_64-unknown-linux-gnu -- --test-threads=1
 	@echo "test-tsan passed"
+
+# Hit vs miss for the PDP decision cache. On demand; not part of `make ci`.
+# Wall-clock numbers are recorded in docs/pdp-decision-cache.md.
+.PHONY: bench-pdp-cache
+bench-pdp-cache:
+	@$(CARGO) bench -p praxis-policy-builtins --bench pdp_decision_cache --features cel
 
 # =============================================================================
 # Benchmarks (issue #19) — on demand, never part of `make ci`
@@ -394,15 +422,19 @@ release-version: release-tool
 release: release-tool
 	@$(CARGO) release $(RELEASE_ARG) --workspace --no-publish --no-push --execute
 
-# Build and verify a .crate for every publishable member without uploading, the
-# same check the release workflow's dry run performs. CI runs this on a clean
-# checkout; --allow-dirty lets it run locally with work in progress.
+# Build a .crate for every publishable member without uploading, then check
+# the changed workspace together with all features. Cargo's per-package verify
+# resolves sibling crate versions from crates.io, where this change is not yet
+# published. The test crates are unpublished and have local-only dependencies.
+# CI runs this on a clean checkout; --allow-dirty permits local work in progress.
 .PHONY: publish-dry
+PACKAGE_TEST_EXCLUDES = --exclude praxis-policy-test-utils \
+	--exclude praxis-policy-tests-integration \
+	--exclude praxis-policy-tests-resilience \
+	--exclude praxis-policy-tests-security
 publish-dry:
-	@$(CARGO) package --workspace --locked --allow-dirty
-# Packaging with default features compiles none of the bundled extensions, so
-# the dry run would prove nothing about them.
-	@$(CARGO) package --workspace --locked --allow-dirty --all-features
+	@$(CARGO) package --workspace $(PACKAGE_TEST_EXCLUDES) --locked --allow-dirty --no-verify
+	@$(CARGO) check --workspace --all-features --locked
 
 # Tag the current commit and push it. The tag is what the release workflow
 # triggers on. VERSION must be semver with no leading `v`.
