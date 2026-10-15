@@ -25,10 +25,18 @@ members = [
   # why it is not a builtin.
   "reference/plugins/pii-scanner",
   "reference/plugins/audit-logger",
+  "reference/plugins/ocsf-audit",
   # Criterion suite for issue #19. Unpublished; excluded from default-members
   # so everyday `cargo build` stays lean. `cargo bench -p ppe-benches` /
   # `make bench` still pick it up, and `clippy --all-targets` compiles it.
   "crates/ppe-benches",
+  # Cross-crate suites and their shared harness. Unpublished, and out of
+  # default-members for the same reason as ppe-benches. They build only in the
+  # `--all-features` pass; see `tests/utils/Cargo.toml`.
+  "tests/utils",
+  "tests/integration",
+  "tests/resilience",
+  "tests/security",
 ]
 
 # The session store pulls a redis client and a TLS stack, which slows a default
@@ -51,10 +59,11 @@ default-members = [
   # why it is not a builtin.
   "reference/plugins/pii-scanner",
   "reference/plugins/audit-logger",
+  "reference/plugins/ocsf-audit",
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 # MSRV. Keep in sync with rust-toolchain.toml `channel` and clippy.toml `msrv`.
 rust-version = "1.92"
@@ -81,6 +90,11 @@ readme = "README.md"
 #
 
 [workspace.dependencies]
+base64 = "0.23.1"
+jsonwebtoken = "11.1.0"
+# rsa 0.9 uses rand_core 0.6, which rand 0.8 implements.
+rand = "0.8.8"
+rsa = "0.9.10"
 # Minimal tokio feature floor for crates that take `tokio = { workspace = true }`
 # without their own `features`. Production code uses time, sync, task/spawn and
 # a multi-threaded runtime; `net` and `io` appear only in tests, and the HTTP
@@ -90,9 +104,20 @@ tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive", "rc"] }
 # NOTE: serde_yaml is deprecated; using yaml_serde (yaml.org maintained fork) as drop-in.
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
-serde_json = "1"
+# `float_roundtrip` so a float parses to the double its digits name. The
+# default parser can land one ULP off, which is invisible until something
+# re-serializes: a verifier that re-parses an emitted record and recomputes
+# an RFC 8785 fingerprint (the OCSF audit sink's, for one) then canonicalizes
+# different bytes and reports an untouched record as tampered.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Shortest round-trip float digits with ties broken to even, the ES6
+# `Number::toString` rule RFC 8785 mandates and Rust's own `{:e}` does not
+# follow (it prints `1424953923781206.3` for the Appendix B tie vector). Already
+# in the graph through `serde_json`, so no new crate.
+ryu = "1.0.23"
 async-trait = "0.1"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
+moka = { version = "0.12.0", features = ["future"] }
 # HTTP types only (no client, no I/O) for the `HttpTransport` seam in
 # praxis-policy-core. Both are already in the tree via the plugins' HTTP
 # clients, so this adds nothing transitively.
@@ -121,6 +146,10 @@ sha2 = "0.11"
 # Keyed digests: audit content provenance and the OAuth cache key. Moves with
 # `sha2` above, since both have to agree on `digest`.
 hmac = "0.13"
+# ECDSA P-256 for the OCSF audit sink's DSSE signatures. RustCrypto's `ecdsa`
+# signs per RFC 6979, so the same key and bytes always give the same
+# signature, which is what keeps the signed conformance vectors reproducible.
+p256 = { version = "0.14.0", features = ["ecdsa", "pem", "pkcs8"] }
 
 # Internal crates. Single source of truth for each one's path and version
 # requirement; members depend on these with `{ workspace = true }` so a version
@@ -130,14 +159,20 @@ hmac = "0.13"
 # The keys are package names, which still carry the engine's previous naming.
 # Renaming them is a manifest change across every crate and lands separately, so
 # that the import stays a move and the rename stays a rename.
-praxis-policy-core = { path = "crates/ppe-core", version = "0.4.1" }
-praxis-policy-orchestration = { path = "crates/ppe-orchestration", version = "0.4.1" }
-praxis-policy-apl-core = { path = "crates/ppe-apl-core", version = "0.4.1" }
-praxis-policy-apl-cmf = { path = "crates/ppe-apl-cmf", version = "0.4.1" }
-praxis-policy-apl-runtime = { path = "crates/ppe-apl-runtime", version = "0.4.1" }
-praxis-policy-builtins = { path = "crates/builtins", version = "0.4.1" }
+praxis-policy-core = { path = "crates/ppe-core", version = "0.5.0" }
+praxis-policy-orchestration = { path = "crates/ppe-orchestration", version = "0.5.0" }
+praxis-policy-apl-core = { path = "crates/ppe-apl-core", version = "0.5.0" }
+praxis-policy-apl-cmf = { path = "crates/ppe-apl-cmf", version = "0.5.0" }
+praxis-policy-apl-runtime = { path = "crates/ppe-apl-runtime", version = "0.5.0" }
+praxis-policy-builtins = { path = "crates/builtins", version = "0.5.0" }
+praxis-policy = { path = "crates/ppe", version = "0.5.0" }
+# Unpublished, so path only.
+praxis-policy-test-utils = { path = "tests/utils" }
+praxis-policy-plugin-audit-logger = { path = "reference/plugins/audit-logger" }
+praxis-policy-plugin-pii-scanner = { path = "reference/plugins/pii-scanner" }
 
-# Criterion is only consumed by the unpublished `ppe-benches` crate (issue #19).
+# Criterion is consumed by the unpublished `ppe-benches` crate (issue #19)
+# and by `praxis-policy-builtins`' `pdp_decision_cache` bench.
 # Kept in the workspace table so version bumps stay one-line.
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
 
@@ -156,6 +191,15 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# RSA key generation in test fixtures takes seconds unoptimized, paid once per
+# test process under nextest. Optimizing just the bignum stack cuts it to well
+# under a second without touching how workspace code is built.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3
 
 [profile.release]
 lto = true
