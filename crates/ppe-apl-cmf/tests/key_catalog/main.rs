@@ -36,6 +36,7 @@ use catalog::{CATALOG, Gating, KeyEntry, KeyType, Shape, entry_for};
 use praxis_policy_apl_cmf::capability_namespaces::{
     capability_namespaces, known_read_capabilities,
 };
+use praxis_policy_apl_cmf::constants::{CAP_READ_HEADERS, CAP_READ_QUERY};
 use praxis_policy_apl_cmf::extract_extensions;
 use praxis_policy_apl_core::{AttributeBag, AttributeValue};
 use praxis_policy_core::extensions::{
@@ -154,6 +155,7 @@ fn fully_populated() -> Extensions {
         status: Some(200),
         method: Some("POST".to_owned()),
         path: Some("/v1".to_owned()),
+        query: Some("service=git-upload-pack".to_owned()),
         host: Some("h".to_owned()),
         scheme: Some("https".to_owned()),
         // The one field this fixture cannot populate: the engine owns this
@@ -817,6 +819,19 @@ fn each_gated_key_arrives_intact_once_its_capability_is_held() {
          emits unfiltered, so the catalog names the wrong capability or the \
          filter drops something it should not: {wrong:#?}"
     );
+}
+
+#[test]
+fn raw_http_query_reaches_pdps_and_only_plugins_with_read_query() {
+    assert_eq!(
+        bag_unfiltered().get_string("http.query"),
+        Some("service=git-upload-pack")
+    );
+    assert_eq!(
+        bag_visible_to(&[CAP_READ_QUERY]).get_string("http.query"),
+        Some("service=git-upload-pack")
+    );
+    assert!(!bag_visible_to(&[CAP_READ_HEADERS]).contains("http.query"));
 }
 
 /// Every capability against every gated key, not just the declared pair.
