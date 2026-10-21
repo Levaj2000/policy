@@ -243,11 +243,9 @@ crate.
 
 ## Known deviations from OCSF 1.9.0
 
-Checked against the 1.9.0 schema files (`events/application/api_activity`,
-`objects/actor`, `objects/user`, `objects/ai_agent`, `objects/delegation`,
-`objects/api`, `dictionary`). The `ai_agent`, `ai_model`, `message_context`,
-`delegation` and `attestation_list` objects the mapping uses are in the
-schema, but not every member or required attribute is:
+Checked against the OCSF 1.9.0 `api_activity` event, `actor`, `user`,
+`ai_agent`, `ai_model`, `message_context`, `delegation`, `api`, and
+`dictionary`. The emitted records have these deviations:
 
 | Emitted | Schema |
 |---|---|
@@ -256,14 +254,15 @@ schema, but not every member or required attribute is:
 | `actor.user.groups` as strings | `user.groups` is an array of `group` objects |
 | top-level `tool` and `resource` | the class carries `resources` (`resource_details[]`); there is no `tool` |
 | `ai_agent.parent_uid`, `ai_agent.conversation_uid`, `ai_agent.turn` | `ai_agent` has `uid`, `instance_uid`, `name`, `type`/`type_id`, `version`, `charter` and `ai_model`; it has no lineage or turn members |
-| `delegation.depth`, `.origin_subject_uid`, `.actor_subject_uid`, `.chain` | `delegation` has `uid`, `parent_uid`, `issuer_uid` and `created_time` only |
+| `ai_model` with only `name` | `ai_provider` is also required |
+| `message_context` with only token counts | at least one of `application` or `service` is required |
+| `delegation.depth`, `.origin_subject_uid`, `.actor_subject_uid`, `.chain`, with no `uid` | `uid` is required; the emitted members are not in `delegation` |
 | no `src_endpoint` | `src_endpoint` is required on API Activity |
-| `api` with only `request.uid`, and no `api` on Completion records | `api` is required on API Activity, and `api.operation` is required within it |
+| `api` only on tool-call records, with only `request.uid` | `api` is required on every API Activity event, and `api.operation` is required within it |
 | `actor` only when the security extension carries a subject (the Completion record in `SAMPLE-OUTPUT.md` has none) | `actor` is required on API Activity |
 
-All of these are inside the hashed bytes, so correcting them changes every
-fingerprint and signature. They move with the deferred change to link chains
-across process starts, in the next AID-EMIT-1 revision with regenerated vectors.
-Until then a collector that validates against the schema needs to accept
-these deviations, including the missing required attributes, and a query on
-`time` must parse the string.
+Fixing these deviations changes the affected fingerprints and signatures.
+The fixes are deferred to the next AID-EMIT-1 revision, alongside the change
+to link chains across process starts and regenerated vectors. Until then,
+collectors that validate against the schema must accept these deviations,
+and queries on `time` must parse a string.
