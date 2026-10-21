@@ -1443,9 +1443,9 @@ fn install_handler(
     // never populate the HTTP extension (nothing to read).
     capabilities.insert("read_headers".to_owned());
     capabilities.insert(praxis_policy_apl_cmf::constants::CAP_READ_QUERY.to_owned());
-    // The built-in PDPs read the parsed LLM request through this handler's
-    // filtered view, so the grant is intrinsic rather than left to the
-    // replaceable baseline. The slot is never flattened into the bag.
+    // The handler reads the raw body for structured PDP input and the
+    // normalized parts for gated `llm.input.*` bag keys. This grant is
+    // intrinsic rather than left to the replaceable baseline.
     capabilities.insert(praxis_policy_apl_cmf::constants::CAP_READ_LLM_REQUEST.to_owned());
     // Route predicates read acquired facts under `metadata.*`, so the grant is
     // intrinsic like `read_headers`. It is a no-op when nothing is installed.

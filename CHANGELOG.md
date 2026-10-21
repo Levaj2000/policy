@@ -19,6 +19,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **`reference/plugins/transcript-scanner`** reads typed prior turns through `read_agent`, including resource blobs decoded as UTF-8 with replacement, and denies with `transcript.detected` on a configured content match. ([#70](https://github.com/praxis-proxy/policy/issues/70))
+- **`llm:` routes can read the request.** One gated `Extensions.llm_request` carrier holds the optional parsed body and normalized parts. The body reaches PDPs at `llm.request`; reported parts emit `llm.input.*` bag keys, including a role-aware instruction digest and candidate count. Model and completion facts emit canonical `llm.model.*` and `llm.output.*` keys. Published `llm.model_id`, `llm.provider`, `llm.capabilities`, and `completion.*` remain value-identical aliases. The carrier is never serialized and requires `read_llm_request` for plugins. Hosts constructing `Extensions` or `OwnedExtensions` with exhaustive literals must update them. ([#70](https://github.com/praxis-proxy/policy/issues/70))
+- **`docs/content/llm-routes.md`** documents canonical keys, missing-key behavior, host obligations, and a tested worked config. ([#70](https://github.com/praxis-proxy/policy/issues/70))
 - Added immutable, framework-owned acquired metadata records under
   `metadata.<instance>.*`. Plugins in the same invocation need `read_metadata`
   to receive the typed slot or its APL projection, and cannot add, replace, or
@@ -33,6 +36,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Breaking: `ConversationContext.history` is `Vec<Message>`, was `Vec<serde_json::Value>`.** Each entry is a CMF message, the same type as the current turn's payload. A host that sent free-form summary objects must now send turns in CMF message shape; anything else fails to deserialize rather than being carried unread. History is still not flattened into the attribute bag; policy reaches it through a plugin. ([#70](https://github.com/praxis-proxy/policy/issues/70))
 - **Breaking:** `Extensions` and `OwnedExtensions` add `metadata`; exhaustive
   struct literals must initialize it (or use `..Default::default()`).
   `Capability` adds `ReadMetadata` and `SlotName` adds `Metadata`, so

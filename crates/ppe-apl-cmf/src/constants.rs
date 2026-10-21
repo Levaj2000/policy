@@ -155,6 +155,28 @@ pub const BAG_HTTP_HOST: &str = "http.host";
 pub const BAG_HTTP_SCHEME: &str = "http.scheme";
 /// Bag key `http.status`, the response status, set on the response half only.
 pub const BAG_HTTP_STATUS: &str = "http.status";
+// Normalized request keys require `read_llm_request`. The raw body is a
+// separate structured PDP value at `llm.request`, never an attribute-bag key.
+/// Bag key `llm.input.offered_tools`.
+pub const BAG_LLM_OFFERED_TOOLS: &str = "llm.input.offered_tools";
+/// Bag key `llm.input.stop_sequences`.
+pub const BAG_LLM_STOP_SEQUENCES: &str = "llm.input.stop_sequences";
+/// Bag key `llm.input.tool_choice`.
+pub const BAG_LLM_TOOL_CHOICE: &str = "llm.input.tool_choice";
+/// Bag key `llm.input.forced_tool`.
+pub const BAG_LLM_FORCED_TOOL: &str = "llm.input.forced_tool";
+/// Bag key `llm.input.max_tokens` (the effective normalized cap).
+pub const BAG_LLM_MAX_TOKENS: &str = "llm.input.max_tokens";
+/// Bag key `llm.input.candidate_count`.
+pub const BAG_LLM_CANDIDATE_COUNT: &str = "llm.input.candidate_count";
+/// Bag key `llm.input.temperature`.
+pub const BAG_LLM_TEMPERATURE: &str = "llm.input.temperature";
+/// Bag key `llm.input.top_p`.
+pub const BAG_LLM_TOP_P: &str = "llm.input.top_p";
+/// Bag key `llm.input.stream`.
+pub const BAG_LLM_STREAM: &str = "llm.input.stream";
+/// Bag key `llm.input.instructions_digest`.
+pub const BAG_LLM_INSTRUCTIONS_DIGEST: &str = "llm.input.instructions_digest";
 // Violation `details` keys carrying a transpiled `denyWith` (custom HTTP
 // denial response). Shared between the producer (praxis-policy-apl-runtime route handler)
 // and any consumer (host renderer / tests) so the stringly-typed contract

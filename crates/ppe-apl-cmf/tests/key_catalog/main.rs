@@ -39,12 +39,14 @@ use praxis_policy_apl_cmf::capability_namespaces::{
 use praxis_policy_apl_cmf::constants::{CAP_READ_HEADERS, CAP_READ_QUERY};
 use praxis_policy_apl_cmf::extract_extensions;
 use praxis_policy_apl_core::{AttributeBag, AttributeValue};
+use praxis_policy_core::cmf::{Message, Role};
 use praxis_policy_core::extensions::{
     AgentExtension, ClientExtension, ClientTrustLevel, CompletionExtension, ConversationContext,
     DelegationExtension, DelegationHop, Extensions, FrameworkExtension, HttpExtension,
-    LLMExtension, MCPExtension, MetaExtension, MetadataCacheDisposition, MonotonicSet,
-    PromptMetadata, ProvenanceExtension, RequestExtension, ResourceMetadata, SecurityExtension,
-    StopReason, SubjectExtension, SubjectType, TokenUsage, ToolMetadata, WorkloadIdentity,
+    LLMExtension, LlmInstruction, LlmInstructionRole, LlmRequest, LlmRequestParts, MCPExtension,
+    MetaExtension, MetadataCacheDisposition, MonotonicSet, PromptMetadata, ProvenanceExtension,
+    RequestExtension, ResourceMetadata, SecurityExtension, StopReason, SubjectExtension,
+    SubjectType, TokenUsage, ToolChoice, ToolMetadata, WorkloadIdentity,
 };
 
 /// One of every slot, with every field carrying a value.
@@ -130,7 +132,7 @@ fn fully_populated() -> Extensions {
         parent_agent_id: Some("pag".to_owned()),
         conversation: Some(ConversationContext {
             // The transcript is deliberately off the bag.
-            history: vec![serde_json::json!({"role": "user"})],
+            history: vec![Message::text(Role::User, "hi")],
             summary: Some("sum".to_owned()),
             topics: vec!["t1".to_owned()],
         }),
@@ -170,6 +172,25 @@ fn fully_populated() -> Extensions {
         model_id: Some("gpt-4".to_owned()),
         provider: Some("openai".to_owned()),
         capabilities: vec!["tools".to_owned()],
+    };
+    let llm_request_normalized_parts = LlmRequestParts {
+        instructions: vec![LlmInstruction {
+            role: LlmInstructionRole::System,
+            text: "prompt".to_owned(),
+        }],
+        offered_tools: vec![ToolMetadata {
+            name: "search".to_owned(),
+            ..Default::default()
+        }],
+        tool_choice: Some(ToolChoice::Tool {
+            name: "search".to_owned(),
+        }),
+        max_tokens: Some(1024),
+        candidate_count: Some(2),
+        temperature: Some(0.5),
+        top_p: Some(0.9),
+        stop_sequences: vec!["END".to_owned()],
+        stream: Some(true),
     };
     let mcp = MCPExtension {
         tool: Some(ToolMetadata {
@@ -252,17 +273,19 @@ fn fully_populated() -> Extensions {
         request: Some(Arc::new(request)),
         http: Some(Arc::new(http)),
         llm: Some(Arc::new(llm)),
+        llm_request: Some(
+            LlmRequest::new(serde_json::json!({"model":"gpt-4"}))
+                .with_parts(llm_request_normalized_parts),
+        ),
         mcp: Some(Arc::new(mcp)),
         completion: Some(Arc::new(completion)),
         provenance: Some(Arc::new(provenance)),
         framework: Some(Arc::new(framework)),
         custom: Some(Arc::new(custom)),
-        // Slots the bridge deliberately does not flatten. `llm_request`
-        // reaches a PDP through a structured side channel and
-        // `raw_credentials` through plugin payloads; neither becomes a key.
+        // The request body reaches PDPs through structured input; raw
+        // credentials reach plugins through payloads.
         candidate_constraint: None,
         raw_credentials: None,
-        llm_request: None,
         http_write_token: None,
         labels_write_token: None,
         delegation_write_token: None,
@@ -342,6 +365,28 @@ fn the_bridge_emits_exactly_the_catalog() {
          {unemitted:?}. Either the bridge stopped writing them or the fixture \
          above stopped populating the field they come from."
     );
+}
+
+#[test]
+fn llm_request_path_is_reserved_and_bag_keys_do_not_collide() {
+    let bag = emitted();
+    let keys: Vec<&str> = bag
+        .iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("llm.") || key.starts_with("completion."))
+        .collect();
+    for key in &keys {
+        assert!(
+            *key != "llm.request" && !key.starts_with("llm.request."),
+            "{key} would overwrite the structured PDP request"
+        );
+        for other in &keys {
+            assert!(
+                *key == *other || !other.starts_with(&format!("{key}.")),
+                "{key} is both a leaf and a parent of {other}"
+            );
+        }
+    }
 }
 
 #[test]
