@@ -57,6 +57,8 @@ pub const CAP_READ_AGENT: &str = "read_agent";
 pub const CAP_READ_HEADERS: &str = "read_headers";
 /// Capability permitting a plugin to read the host-parsed LLM request document.
 pub const CAP_READ_LLM_REQUEST: &str = "read_llm_request";
+/// Capability permitting a plugin to read externally acquired metadata.
+pub const CAP_READ_METADATA: &str = "read_metadata";
 
 /// Capability permitting a plugin to append to session security labels.
 pub const CAP_APPEND_LABELS: &str = "append_labels";
@@ -131,6 +133,8 @@ pub const BAG_DELEGATED: &str = "delegated";
 
 /// Key prefix for agent session and lineage, as in `agent.<name>`.
 pub const BAG_AGENT_PREFIX: &str = "agent.";
+/// Key prefix for acquired metadata, as in `metadata.<instance>.<name>`.
+pub const BAG_METADATA_PREFIX: &str = "metadata.";
 /// Key prefix for http request headers, as in `http.request_headers.<name>`.
 pub const BAG_HTTP_REQUEST_HEADERS_PREFIX: &str = "http.request_headers.";
 /// Key prefix for http response headers, as in `http.response_headers.<name>`.
