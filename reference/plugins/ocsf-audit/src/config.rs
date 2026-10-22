@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Praxis Contributors
 
 // Operator-facing config for the OCSF audit sink. Follows the audit-logger
-// config style (serde, snake_case enums, stderr default) and adds the OCSF
-// and attestation settings.
+// config style (serde, snake_case enums, an explicit destination) and adds
+// the OCSF and attestation settings.
 
 //! Operator configuration: exporters, product identity, chaining and
 //! signing.
@@ -26,14 +26,18 @@ use crate::emitter::TracingExporter;
 pub struct OcsfAuditConfig {
     /// Where OCSF events go, as a single destination: `stderr` or
     /// `tracing`. Mutually exclusive with `exporters`, which can name
-    /// several. With neither set, records go to stderr, which keeps the
-    /// demo flow (`docker compose logs -f | jq`) identical to audit-logger.
+    /// several. One of the two is required: with neither set the sink
+    /// refuses to load, so an audit entry that names no output is never
+    /// mistaken for one that works. `stderr` keeps the demo flow
+    /// (`docker compose logs -f | jq`) identical to audit-logger, but it
+    /// is a choice the entry has to make.
     #[serde(default)]
     pub destination: Option<OcsfDestination>,
 
     /// Where OCSF events go, as a list of exporters. Every record is
     /// written, byte for byte, to each one. Mutually exclusive with
-    /// `destination`; an empty list is rejected.
+    /// `destination`, and required when `destination` is unset; an empty
+    /// list is rejected.
     ///
     /// ```yaml
     /// exporters:
@@ -169,12 +173,12 @@ fn default_true() -> bool {
     true
 }
 
-/// Where a record is written.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Where a record is written. No variant is the default: an entry picks one
+/// or lists `exporters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OcsfDestination {
     /// One OCSF JSON object per line to stderr.
-    #[default]
     Stderr,
     /// Emit via `tracing::info!` at target `ocsf.audit`.
     Tracing,
@@ -236,28 +240,39 @@ impl OcsfExporterConfig {
 
 impl OcsfAuditConfig {
     /// The exporters records go to: `exporters` when set, otherwise the one
-    /// `destination` names, otherwise stderr.
+    /// `destination` names.
     ///
     /// # Errors
     ///
-    /// `destination` and `exporters` both set, an empty `exporters` list, or
-    /// an exporter that cannot be opened.
+    /// Neither `destination` nor `exporters` set, both set, an empty
+    /// `exporters` list, or an exporter that cannot be opened. The missing
+    /// case is an error rather than a stderr fallback so that an entry
+    /// with no output configured fails the load instead of looking like a
+    /// working audit sink ([#237]).
+    ///
+    /// [#237]: https://github.com/praxis-proxy/policy/issues/237
     pub fn build_exporters(&self) -> Result<Vec<Arc<dyn AuditExporter>>, ExportError> {
         match (&self.destination, &self.exporters) {
+            (None, None) => Err(ExportError::Config(MISSING_OUTPUT.to_owned())),
             (Some(_), Some(_)) => Err(ExportError::Config(
                 "set either `destination` or `exporters`, not both".to_owned(),
             )),
             (_, Some(list)) if list.is_empty() => Err(ExportError::Config(
-                "`exporters` is empty; name at least one, or omit it for stderr".to_owned(),
+                "`exporters` is empty; name at least one of stderr, stdout, file or tracing"
+                    .to_owned(),
             )),
             (_, Some(list)) => list.iter().map(OcsfExporterConfig::build).collect(),
             (Some(OcsfDestination::Tracing), None) => Ok(vec![Arc::new(TracingExporter)]),
-            (Some(OcsfDestination::Stderr) | None, None) => {
-                Ok(vec![ExporterConfig::Stderr.build()?])
-            },
+            (Some(OcsfDestination::Stderr), None) => Ok(vec![ExporterConfig::Stderr.build()?]),
         }
     }
 }
+
+/// The error for an entry that names no output at all. Lists every option
+/// so the operator can finish the entry from the message alone.
+const MISSING_OUTPUT: &str = "no audit destination configured; set `destination: stderr` or \
+                              `destination: tracing`, or list `exporters` (kinds: stderr, \
+                              stdout, file, tracing)";
 
 /// How the attestation is signed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

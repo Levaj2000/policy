@@ -30,21 +30,34 @@ pub struct AuditLogger {
 impl AuditLogger {
     /// # Errors
     ///
-    /// Returns `PluginError::Config` when the `config:` block is absent or does
-    /// not deserialize into this plugin's settings, and when a validated field
-    /// is out of range.
+    /// Returns `PluginError::Config` when the `config:` block names no
+    /// `destination`, or does not parse. A missing destination is an error
+    /// rather than a stderr fallback, so an entry with no output configured
+    /// fails the load instead of looking like a working audit sink
+    /// ([#237]).
+    ///
+    /// [#237]: https://github.com/praxis-proxy/policy/issues/237
     pub fn new(cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
-        let typed: AuditLoggerConfig = match cfg.config.as_ref() {
-            Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
-                Box::new(PluginError::Config {
+        let raw = match cfg.config.as_ref() {
+            Some(raw) if raw.get("destination").is_some() => raw,
+            _ => {
+                return Err(Box::new(PluginError::Config {
                     message: format!(
-                        "plugin '{}' (praxis-policy-plugin-audit-logger) config parse failed: {e}",
+                        "plugin '{}' (praxis-policy-plugin-audit-logger): no audit destination \
+                         configured; set `destination: stderr` or `destination: tracing`",
                         cfg.name
                     ),
-                })
-            })?,
-            None => AuditLoggerConfig::default(),
+                }));
+            },
         };
+        let typed: AuditLoggerConfig = serde_json::from_value(raw.clone()).map_err(|e| {
+            Box::new(PluginError::Config {
+                message: format!(
+                    "plugin '{}' (praxis-policy-plugin-audit-logger) config parse failed: {e}",
+                    cfg.name
+                ),
+            })
+        })?;
         Ok(Self { cfg, typed })
     }
 
@@ -594,17 +607,35 @@ mod tests {
         assert_eq!(record["source"], "edge-gateway-1");
     }
 
-    /// With no `config:` block at all the plugin takes its defaults rather than
-    /// failing, so an operator can wire it with just `kind:` and `hooks:`.
+    /// With no `config:` block, or one that names no `destination`, the
+    /// plugin used to take stderr silently, which made a half-written audit
+    /// entry look like a working one. Both now fail the load with a message
+    /// that lists the options (#237).
     #[test]
-    fn an_absent_config_block_falls_back_to_defaults() {
-        let mut c = cfg();
-        c.config = None;
-        let plugin = AuditLogger::new(c).expect("no config block must still build");
+    fn a_missing_destination_is_rejected_with_the_options_listed() {
+        let mut absent = cfg();
+        absent.config = None;
+        let mut silent = cfg();
+        silent.config = Some(serde_json::json!({ "source": "gateway-eu-1" }));
+        for c in [absent, silent] {
+            let err =
+                AuditLogger::new(c).expect_err("an entry without a destination must not build");
+            let msg = err.to_string();
+            assert!(msg.contains("no audit destination configured"), "{msg}");
+            assert!(msg.contains("`destination: stderr`"), "{msg}");
+            assert!(msg.contains("`destination: tracing`"), "{msg}");
+        }
+    }
+
+    /// `stderr` is still available; it just has to be named.
+    #[test]
+    fn an_explicit_stderr_destination_builds() {
+        let plugin = AuditLogger::new(cfg()).expect("destination: stderr must build");
+        assert_eq!(plugin.typed.destination, AuditDestination::Stderr);
         let record = plugin.build_record(Some(&empty_payload()), &Extensions::default());
         assert!(
             record.get("source").is_none(),
-            "the default carries no source tag"
+            "no source was configured, so none is stamped"
         );
     }
 

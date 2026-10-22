@@ -36,6 +36,12 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Breaking for the reference audit plugins:** `audit/logger` requires
+  `destination:` and `audit/ocsf` requires `destination:` or `exporters:`.
+  Neither falls back to stderr any more: an entry that names no output fails
+  the load with the options listed, so an incomplete audit configuration no
+  longer looks like a working one. `stderr` is still available and has to be
+  named. ([#237](https://github.com/praxis-proxy/policy/issues/237))
 - **Breaking: `ConversationContext.history` is `Vec<Message>`, was `Vec<serde_json::Value>`.** Each entry is a CMF message, the same type as the current turn's payload. A host that sent free-form summary objects must now send turns in CMF message shape; anything else fails to deserialize rather than being carried unread. History is still not flattened into the attribute bag; policy reaches it through a plugin. ([#70](https://github.com/praxis-proxy/policy/issues/70))
 - **Breaking:** `Extensions` and `OwnedExtensions` add `metadata`; exhaustive
   struct literals must initialize it (or use `..Default::default()`).

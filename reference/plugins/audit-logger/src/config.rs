@@ -3,14 +3,16 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Audit logger settings.
+///
+/// No `Default`: `destination` is a choice the entry has to make, so an
+/// audit entry that names no output fails the load instead of quietly
+/// writing somewhere the operator never picked.
 pub struct AuditLoggerConfig {
-    /// Where audit records go. Stderr is the default — convenient
-    /// for the demo (`docker compose logs -f`) and for k8s sidecar
-    /// log forwarding. Tracing routes through whatever subscriber
-    /// the host installed.
-    #[serde(default)]
+    /// Where audit records go. Required. `stderr` suits the demo
+    /// (`docker compose logs -f`) and k8s sidecar log forwarding;
+    /// `tracing` routes through whatever subscriber the host installed.
     pub destination: AuditDestination,
 
     /// Optional sink name — surfaces in every record so a single
@@ -20,12 +22,11 @@ pub struct AuditLoggerConfig {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-/// Where audit records are written.
+/// Where audit records are written. No variant is the default.
 pub enum AuditDestination {
     /// Write one JSON line per call to stderr.
-    #[default]
     Stderr,
     /// Emit via `tracing::info!` at target `apl.audit`. Routed by
     /// the host's subscriber to wherever traces normally go.

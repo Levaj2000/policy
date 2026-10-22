@@ -91,7 +91,7 @@ plugins:
       - read_labels            # the taint diff
       - read_delegated_tokens  # which audience got which scopes
     config:
-      destination: stderr      # or `tracing`
+      destination: stderr      # required: `stderr` or `tracing`
       source: gateway-eu-1     # optional, stamped on every record
 ```
 
@@ -104,7 +104,10 @@ verifier checks offline with the public key. It renders decisions only:
 `on_effect` keeps its ignoring default, so effects do not become OCSF events.
 It writes each record through the exporters in `praxis_policy_core::audit::export`:
 `exporters:` lists any of `stderr`, `stdout`, an append-only `file`, and
-`tracing`, and every record goes to each one byte for byte. Its README under
+`tracing`, and every record goes to each one byte for byte. Either `exporters:`
+or a single `destination:` is required; neither plugin falls back to stderr, so
+an entry that names no output fails the load with the options listed rather
+than looking like a working sink. Its README under
 `reference/plugins/ocsf-audit/` documents the record, the exporters, the
 verifier rule and the sink's known deviations from the published schema.
 
