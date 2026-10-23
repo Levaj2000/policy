@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 /// What operators write under `plugins[<name>].config:` in unified
 /// config YAML for a CIBA elicitation handler.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CibaConfig {
     /// OIDC CIBA backchannel authentication endpoint — where the
     /// `dispatch` POST lands (e.g.
@@ -62,12 +63,37 @@ pub struct CibaConfig {
     /// development against a docker-compose Keycloak.
     #[serde(default)]
     pub insecure_http: bool,
+
+    /// Where pending approvals live. Select process memory explicitly when
+    /// approvals need not survive a restart or cross replicas.
+    pub store: StoreConfig,
 }
+
+/// The correlation store a CIBA plugin uses.
+#[derive(Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum StoreConfig {
+    /// Process memory. Pending approvals do not survive a restart or reach
+    /// another replica.
+    Memory(MemoryStoreConfig),
+    /// Valkey, shared across replicas. Requires the `valkey` feature.
+    Valkey(serde_json::Map<String, serde_json::Value>),
+}
+
+/// `kind: memory` takes no settings.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "a braced struct is what lets `deny_unknown_fields` refuse stray settings"
+)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryStoreConfig {}
 
 /// Where the gateway's OAuth client secret is loaded from. Mirrors
 /// `apl-delegator-oauth`'s source enum — env var (production), file
 /// (k8s secret volume), or literal (tests/dev only).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientSecretSource {
     /// Read from an environment variable.
@@ -85,6 +111,34 @@ pub enum ClientSecretSource {
         /// The secret inline. Avoid outside local development.
         secret: String,
     },
+}
+
+impl std::fmt::Debug for CibaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CibaConfig")
+            .field("client_id", &self.client_id)
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for StoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(_) => f.write_str("Memory"),
+            Self::Valkey(_) => f.write_str("Valkey([REDACTED])"),
+        }
+    }
+}
+
+impl std::fmt::Debug for ClientSecretSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvVar { name } => f.debug_struct("EnvVar").field("name", name).finish(),
+            Self::File { path } => f.debug_struct("File").field("path", path).finish(),
+            Self::Literal { .. } => f.write_str("Literal([REDACTED])"),
+        }
+    }
 }
 
 fn default_scope() -> String {
@@ -119,9 +173,8 @@ impl ClientSecretSource {
     /// file cannot be read. The secret itself never appears in the error.
     pub fn resolve(&self) -> Result<String, String> {
         match self {
-            Self::EnvVar { name } => {
-                std::env::var(name).map_err(|e| format!("env var '{name}' unavailable: {e}"))
-            },
+            Self::EnvVar { name } => std::env::var(name)
+                .map_err(|error| crate::env_secret::error("client secret", name, error)),
             Self::File { path } => std::fs::read_to_string(path)
                 .map(|s| s.trim().to_owned())
                 .map_err(|e| format!("secret file '{}' unreadable: {e}", path.display())),
@@ -167,6 +220,7 @@ mod tests {
             "token_endpoint": "https://kc/realms/corp/protocol/openid-connect/token",
             "client_id": "praxis-policy-gateway",
             "client_secret_source": { "kind": "literal", "secret": "dev-only" },
+            "store": { "kind": "memory" },
         });
         let cfg: CibaConfig = serde_json::from_value(raw).unwrap();
         assert_eq!(cfg.client_id, "praxis-policy-gateway");
@@ -175,6 +229,19 @@ mod tests {
         assert_eq!(cfg.http_timeout_seconds, 5);
         assert_eq!(cfg.approver_claim, "preferred_username");
         assert!(!cfg.insecure_http);
+        assert!(matches!(cfg.store, StoreConfig::Memory(_)));
+    }
+
+    #[test]
+    fn omitted_store_is_rejected() {
+        let raw = json!({
+            "backchannel_endpoint": "https://kc/ciba/auth",
+            "token_endpoint": "https://kc/token",
+            "client_id": "praxis-policy-gateway",
+            "client_secret_source": { "kind": "literal", "secret": "dev-only" },
+        });
+        let error = serde_json::from_value::<CibaConfig>(raw).unwrap_err();
+        assert!(error.to_string().contains("store"), "{error}");
     }
 
     #[test]
@@ -183,6 +250,42 @@ mod tests {
             secret: "hush".into(),
         };
         assert_eq!(src.resolve().unwrap(), "hush");
+    }
+
+    #[test]
+    fn invalid_unicode_secret_env_error_omits_the_value() {
+        let message = crate::env_secret::error(
+            "client secret",
+            "CIBA_SECRET",
+            std::env::VarError::NotUnicode(std::ffi::OsString::from("sensitive-value")),
+        );
+        assert!(message.contains("CIBA_SECRET"), "got {message}");
+        assert!(message.contains("not valid Unicode"), "got {message}");
+        assert!(!message.contains("sensitive-value"), "got {message}");
+        assert!(
+            crate::env_secret::error(
+                "client secret",
+                "CIBA_SECRET",
+                std::env::VarError::NotPresent
+            )
+            .contains("not set"),
+            "a missing variable must be distinguishable from invalid Unicode"
+        );
+    }
+
+    #[test]
+    fn config_debug_hides_inline_client_and_store_secrets() {
+        let config: CibaConfig = serde_json::from_value(serde_json::json!({
+            "backchannel_endpoint": "https://op.example/ciba",
+            "token_endpoint": "https://op.example/token",
+            "client_id": "gateway",
+            "client_secret_source": { "kind": "literal", "secret": "oauth-secret" },
+            "store": { "kind": "valkey", "endpoint": "localhost:6379", "password": "store-secret" }
+        }))
+        .unwrap();
+        let debug = format!("{config:?} {:?}", config.client_secret_source);
+        assert!(!debug.contains("oauth-secret"));
+        assert!(!debug.contains("store-secret"));
     }
 
     #[test]

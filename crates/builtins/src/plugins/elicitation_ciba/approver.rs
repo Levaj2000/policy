@@ -26,6 +26,7 @@
 // they're returned as data on the payload via `modify_payload`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -39,6 +40,7 @@ use praxis_policy_core::elicitation::{
     ElicitationStatusKind,
 };
 use praxis_policy_core::error::{PluginError, PluginViolation};
+use praxis_policy_core::factory::FactoryContext;
 use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
 use praxis_policy_core::host::{HostServices as _, HttpRequestError};
@@ -47,9 +49,9 @@ use praxis_policy_core::http_retry::RetryPolicy;
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
 use crate::plugins::elicitation_ciba::KIND;
-use crate::plugins::elicitation_ciba::config::{CibaConfig, require_https};
+use crate::plugins::elicitation_ciba::config::{CibaConfig, StoreConfig, require_https};
 use crate::plugins::elicitation_ciba::store::{
-    Correlation, CorrelationStore, InMemoryCorrelationStore, TakeResult,
+    Correlation, CorrelationStore, InMemoryCorrelationStore, PollClaim, StoreError, TakeResult,
 };
 
 /// OIDC CIBA grant type for the token-endpoint poll.
@@ -95,6 +97,21 @@ impl CibaApprover {
     /// not deserialize into this plugin's settings, and when a validated field
     /// is out of range.
     pub fn new(cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
+        Self::with_context(cfg, &FactoryContext::default())
+    }
+
+    /// Build an approver with document-level settings for a CIBA `store` that
+    /// references `global.session_store`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], and when the `store` block cannot be built.
+    ///
+    /// [`Self::new`]: CibaApprover::new
+    pub fn with_context(
+        cfg: PluginConfig,
+        context: &FactoryContext,
+    ) -> Result<Self, Box<PluginError>> {
         let raw = cfg
             .config
             .as_ref()
@@ -123,14 +140,27 @@ impl CibaApprover {
             .map_err(|e| cfg_err(&cfg.name, format!("client secret resolve failed: {e}")))?;
 
         let http_timeout = typed.http_timeout();
+        let store = build_store(&cfg.name, &typed.store, context)?;
 
         Ok(Self {
             cfg,
             typed,
             client_secret: Zeroizing::new(secret),
             http_timeout,
-            store: Arc::new(InMemoryCorrelationStore::new()),
+            store,
         })
+    }
+
+    /// Log a store failure for operators, then deny.
+    fn store_unavailable(&self, op: &str, err: &StoreError) -> PluginResult<ElicitationPayload> {
+        tracing::error!(
+            alarm = "ciba_store_unavailable",
+            plugin = %self.cfg.name,
+            op,
+            error = %err,
+            "CIBA correlation store failed"
+        );
+        store_unavailable()
     }
 
     /// Build a form POST to `endpoint`, carrying our client credentials.
@@ -324,17 +354,27 @@ impl CibaApprover {
                 "CIBA backchannel expiry is out of range",
             );
         };
-        self.store.put(
-            &id,
-            Correlation {
-                expected_approver: login_hint.to_owned(),
-                resolved_approver: None,
-                route_key: payload.route_key().to_owned(),
-                tool: payload.tool().to_owned(),
-                requester: payload.requester().to_owned(),
-                expires_at,
-            },
-        );
+        let correlation = Correlation {
+            expected_approver: login_hint.to_owned(),
+            resolved_approver: None,
+            route_key: payload.route_key().to_owned(),
+            tool: payload.tool().to_owned(),
+            requester: payload.requester().to_owned(),
+            expires_at,
+        };
+        if let Err(e) = self.store.put(&id, correlation).await {
+            // The OP already prompted the human, so this id is the only link
+            // between that prompt and the lost correlation.
+            tracing::error!(
+                alarm = "ciba_store_unavailable",
+                plugin = %self.cfg.name,
+                route = payload.route_key(),
+                auth_req_id = %id,
+                error = %e,
+                "CIBA dispatch reached the OP but its correlation was not stored"
+            );
+            return store_unavailable();
+        }
 
         let mut out = payload.clone();
         out.id = Some(id);
@@ -359,8 +399,10 @@ impl CibaApprover {
             },
         };
 
-        let Some(correlation) = self.store.get(id) else {
-            return deny("elicitation.unknown_id", "unknown elicitation id");
+        let correlation = match self.store.get(id).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return deny("elicitation.unknown_id", "unknown elicitation id"),
+            Err(e) => return self.store_unavailable("check", &e),
         };
         if correlation.route_key != payload.route_key()
             || correlation.tool != payload.tool()
@@ -379,10 +421,7 @@ impl CibaApprover {
         // (the spent id would come back `invalid_grant`). Replay the cached
         // approved result instead; `validate` re-compares the approver.
         if correlation.resolved_approver.is_some() {
-            let mut out = payload.clone();
-            out.status = Some(ElicitationStatusKind::Resolved);
-            out.outcome = Some(ElicitationOutcomeKind::Approved);
-            return PluginResult::modify_payload(out);
+            return approved_check(payload);
         }
 
         let form: Vec<(&str, &str)> = vec![("grant_type", GRANT_TYPE_CIBA), ("auth_req_id", id)];
@@ -396,12 +435,71 @@ impl CibaApprover {
             Ok(r) => r,
             Err(v) => return PluginResult::deny(*v),
         };
-        let response = match ext
-            .http_request(request, RetryPolicy::undelivered_only())
+        let owner = uuid::Uuid::new_v4().to_string();
+        let retry = RetryPolicy::undelivered_only();
+        // An undelivered connect failure can consume nearly a full request
+        // timeout. Keep the claim through every attempt and backoff so another
+        // checker cannot mark an active poll uncertain before it completes.
+        let lease = self
+            .http_timeout
+            .saturating_mul(retry.max_attempts)
+            .saturating_add(
+                retry
+                    .max_backoff
+                    .saturating_mul(retry.max_attempts.saturating_sub(1)),
+            )
+            .saturating_add(Duration::from_secs(5));
+        match self
+            .store
+            .claim_poll(
+                id,
+                &owner,
+                lease,
+                payload.route_key(),
+                payload.tool(),
+                payload.requester(),
+            )
             .await
         {
+            Ok(PollClaim::Acquired) => {},
+            Ok(PollClaim::Busy) => {
+                let mut out = payload.clone();
+                out.status = Some(ElicitationStatusKind::Pending);
+                return PluginResult::modify_payload(out);
+            },
+            Ok(PollClaim::Resolved) => return approved_check(payload),
+            Ok(PollClaim::Missing) => {
+                return deny("elicitation.unknown_id", "unknown elicitation id");
+            },
+            Ok(PollClaim::BindingMismatch) => {
+                return deny(
+                    "elicitation.binding_mismatch",
+                    "approval belongs to another route, tool, or requester",
+                );
+            },
+            Ok(PollClaim::Uncertain) => {
+                return self.store_unavailable(
+                    "check",
+                    &StoreError::new("an earlier OP poll may have spent the approval"),
+                );
+            },
+            Err(e) => return self.store_unavailable("check", &e),
+        }
+        let response = match ext.http_request(request, retry).await {
             Ok(r) => r,
             Err(e) => {
+                let uncertain = matches!(
+                    &e,
+                    HttpRequestError::Transport(error) if error.may_have_reached_peer()
+                );
+                let stored = if uncertain {
+                    self.store.abandon_poll(id, &owner).await
+                } else {
+                    self.store.release_poll(id, &owner).await
+                };
+                if let Err(error) = stored {
+                    return self.store_unavailable("check", &error);
+                }
                 return PluginResult::deny(self.op_violation("CIBA token poll", &e));
             },
         };
@@ -417,6 +515,9 @@ impl CibaApprover {
             let parsed: TokenResponse = match serde_json::from_str(&body) {
                 Ok(p) => p,
                 Err(e) => {
+                    if let Err(error) = self.store.abandon_poll(id, &owner).await {
+                        return self.store_unavailable("check", &error);
+                    }
                     return deny(
                         "elicitation.bad_response",
                         format!("CIBA token response wasn't valid JSON: {e}"),
@@ -425,22 +526,45 @@ impl CibaApprover {
             };
             // Prefer the id_token (carries user claims); fall back to the
             // access_token. Extract the approver claim and drop the token.
-            if let Some(token) = parsed.id_token.or(parsed.access_token)
-                && let Some(approver) = decode_jwt_claim(&token, &self.typed.approver_claim)
-            {
-                self.store.set_resolved_approver(id, approver);
+            let approver = parsed
+                .id_token
+                .or(parsed.access_token)
+                .and_then(|token| decode_jwt_claim(&token, &self.typed.approver_claim));
+            let Some(approver) = approver else {
+                if let Err(error) = self.store.abandon_poll(id, &owner).await {
+                    return self.store_unavailable("check", &error);
+                }
+                return deny(
+                    "elicitation.bad_response",
+                    "CIBA token response lacks approver claim",
+                );
+            };
+            if let Err(e) = self.store.complete_poll(id, &owner, approver).await {
+                // The OP has spent this auth_req_id. If the store did not
+                // commit the write, only a new elicitation can recover it.
+                return self.store_unavailable("check", &e);
             }
             // token dropped here — never persisted.
-            let mut out = payload.clone();
-            out.status = Some(ElicitationStatusKind::Resolved);
-            out.outcome = Some(ElicitationOutcomeKind::Approved);
-            return PluginResult::modify_payload(out);
+            return approved_check(payload);
         }
 
         // Non-2xx: a standard OAuth error body drives the lifecycle.
         let err_code = serde_json::from_str::<OAuthError>(&body)
             .map(|e| e.error)
             .unwrap_or_default();
+
+        if err_code == "invalid_grant" {
+            match self.store.get(id).await {
+                Ok(Some(c)) if c.resolved_approver.is_some() => {
+                    if let Err(error) = self.store.release_poll(id, &owner).await {
+                        return self.store_unavailable("check", &error);
+                    }
+                    return approved_check(payload);
+                },
+                Ok(_) => {},
+                Err(error) => return self.store_unavailable("check", &error),
+            }
+        }
 
         let (status_kind, outcome) = match err_code.as_str() {
             // Still waiting — both mean "keep polling".
@@ -452,12 +576,19 @@ impl CibaApprover {
             ),
             // Anything else is a genuine failure, not a lifecycle state.
             _ => {
+                if let Err(error) = self.store.abandon_poll(id, &owner).await {
+                    return self.store_unavailable("check", &error);
+                }
                 return deny(
                     "elicitation.op_rejected",
                     format!("CIBA token poll failed ({status})"),
                 );
             },
         };
+
+        if let Err(error) = self.store.release_poll(id, &owner).await {
+            return self.store_unavailable("check", &error);
+        }
 
         let mut out = payload.clone();
         out.status = Some(status_kind);
@@ -477,40 +608,41 @@ impl CibaApprover {
         };
 
         let correlation = if payload.peek() {
-            match self.store.get(id) {
-                Some(c)
+            match self.store.get(id).await {
+                Err(e) => return self.store_unavailable("validate", &e),
+                Ok(Some(c))
                     if c.route_key == payload.route_key()
                         && c.tool == payload.tool()
                         && c.requester == payload.requester() =>
                 {
                     c
                 },
-                Some(_) => {
+                Ok(Some(_)) => {
                     return deny(
                         "elicitation.binding_mismatch",
                         "approval belongs to another route, tool, or requester",
                     );
                 },
-                None => return deny("elicitation.unknown_id", "unknown elicitation id"),
+                Ok(None) => return deny("elicitation.unknown_id", "unknown elicitation id"),
             }
         } else {
-            match self.store.take_if_ready(
-                id,
-                payload.route_key(),
-                payload.tool(),
-                payload.requester(),
-            ) {
-                TakeResult::Ready(c) => c,
-                TakeResult::Missing => {
+            let taken = self
+                .store
+                .take_if_ready(id, payload.route_key(), payload.tool(), payload.requester())
+                .await;
+            match taken {
+                Err(e) => return self.store_unavailable("validate", &e),
+                Ok(TakeResult::Ready(c)) => c,
+                Ok(TakeResult::Missing) => {
                     return deny("elicitation.unknown_id", "unknown elicitation id");
                 },
-                TakeResult::BindingMismatch => {
+                Ok(TakeResult::BindingMismatch) => {
                     return deny(
                         "elicitation.binding_mismatch",
                         "approval belongs to another route, tool, or requester",
                     );
                 },
-                TakeResult::Pending => {
+                Ok(TakeResult::Pending) => {
                     return invalid(payload, "elicitation has no resolved approver");
                 },
             }
@@ -546,6 +678,13 @@ impl CibaApprover {
         }
         PluginResult::modify_payload(out)
     }
+}
+
+fn approved_check(payload: &ElicitationPayload) -> PluginResult<ElicitationPayload> {
+    let mut out = payload.clone();
+    out.status = Some(ElicitationStatusKind::Resolved);
+    out.outcome = Some(ElicitationOutcomeKind::Approved);
+    PluginResult::modify_payload(out)
 }
 
 #[async_trait]
@@ -615,6 +754,47 @@ struct OAuthError {
     error: String,
 }
 
+/// Build the configured correlation store.
+fn build_store(
+    plugin: &str,
+    store: &StoreConfig,
+    context: &FactoryContext,
+) -> Result<Arc<dyn CorrelationStore>, Box<PluginError>> {
+    match store {
+        StoreConfig::Memory(_) => Ok(Arc::new(InMemoryCorrelationStore::new())),
+        StoreConfig::Valkey(settings) => valkey_store(plugin, settings, context),
+    }
+}
+
+#[cfg(feature = "valkey")]
+fn valkey_store(
+    plugin: &str,
+    settings: &serde_json::Map<String, serde_json::Value>,
+    context: &FactoryContext,
+) -> Result<Arc<dyn CorrelationStore>, Box<PluginError>> {
+    let store =
+        crate::plugins::elicitation_ciba::valkey_store::ValkeyCorrelationStore::from_settings(
+            plugin,
+            settings,
+            context.session_store(),
+        )
+        .map_err(|e| cfg_err(plugin, format!("store: {e}")))?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "valkey"))]
+fn valkey_store(
+    plugin: &str,
+    _settings: &serde_json::Map<String, serde_json::Value>,
+    _context: &FactoryContext,
+) -> Result<Arc<dyn CorrelationStore>, Box<PluginError>> {
+    Err(cfg_err(
+        plugin,
+        "store kind `valkey` needs the `valkey` feature, which this build does not include"
+            .to_owned(),
+    ))
+}
+
 fn cfg_err(plugin: &str, msg: String) -> Box<PluginError> {
     Box::new(PluginError::Config {
         message: format!("plugin '{plugin}' ({KIND}): {msg}"),
@@ -623,6 +803,16 @@ fn cfg_err(plugin: &str, msg: String) -> Box<PluginError> {
 
 fn deny(code: &str, reason: impl Into<String>) -> PluginResult<ElicitationPayload> {
     PluginResult::deny(PluginViolation::new(code, reason.into()))
+}
+
+/// A store failure leaves the approval's state unknown, so it denies with its
+/// own code rather than reading as a missing id. The backend detail goes to
+/// the log only: it can carry server names or ACL text.
+fn store_unavailable() -> PluginResult<ElicitationPayload> {
+    deny(
+        praxis_policy_core::elicitation::STORE_UNAVAILABLE_CODE,
+        "approval state is unavailable (fail-closed)",
+    )
 }
 
 /// `validate` failure that is a *verdict*, not a transport error: the
@@ -764,7 +954,7 @@ mod tests {
     fn approver_with(correlations: &[(&str, &str, Option<&str>)]) -> CibaApprover {
         let store = InMemoryCorrelationStore::new();
         for (id, expected, resolved) in correlations {
-            store.put(
+            store.insert(
                 id,
                 Correlation {
                     expected_approver: (*expected).to_owned(),
@@ -785,6 +975,7 @@ mod tests {
                 "token_endpoint": "https://idp.example/token",
                 "client_id": "praxis-policy-gateway",
                 "client_secret_source": { "kind": "literal", "secret": "shh" },
+                "store": { "kind": "memory" },
             })),
             ..Default::default()
         };

@@ -17,6 +17,7 @@
     reason = "test and example code"
 )]
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::json;
@@ -33,7 +34,8 @@ use praxis_policy_core::http_testing::FakeTransport;
 use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 
 use praxis_policy_builtins::plugins::elicitation_ciba::{
-    CibaApprover, Correlation, CorrelationStore as _, InMemoryCorrelationStore,
+    CibaApprover, Correlation, CorrelationStore, InMemoryCorrelationStore, PollClaim, StoreError,
+    TakeResult,
 };
 
 // ---------------------------------------------------------------------
@@ -62,6 +64,7 @@ fn approver() -> CibaApprover {
             "client_id": "praxis-policy-gateway",
             "client_secret_source": { "kind": "literal", "secret": "shh" },
             "insecure_http": true,
+            "store": { "kind": "memory" },
         })),
     };
     CibaApprover::new(cfg).expect("construct approver")
@@ -71,7 +74,7 @@ fn approver() -> CibaApprover {
 /// correlation when a test isolates the polling leg.
 fn approver_with_pending() -> CibaApprover {
     let store = InMemoryCorrelationStore::new();
-    store.put(
+    store.insert(
         "REQ-123",
         Correlation {
             expected_approver: "alice@corp.com".into(),
@@ -739,6 +742,40 @@ async fn a_second_check_after_approval_replays_instead_of_repolling() {
     assert_eq!(http.call_count_for(TOKEN_PATH), 1);
 }
 
+#[tokio::test]
+async fn concurrent_checks_poll_a_single_use_id_once() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(
+                TOKEN_PATH,
+                200,
+                &json!({ "id_token": fake_id_token("alice@corp.com") }).to_string(),
+            )
+            .with_latency(Duration::from_millis(50)),
+    );
+    let app = approver_with_pending();
+    let check = || {
+        ElicitationPayload::new(ElicitationOp::Check, "approval", "").with_elicitation_id("REQ-123")
+    };
+    let (first, second) = tokio::join!(run(&app, &http, check()), run(&app, &http, check()));
+    assert_eq!(
+        http.call_count_for(TOKEN_PATH),
+        1,
+        "only the claim owner polls"
+    );
+    assert!(
+        [first.status, second.status].contains(&Some(ElicitationStatusKind::Pending)),
+        "the competing check stays pending"
+    );
+    assert!(
+        [first.outcome, second.outcome].contains(&Some(ElicitationOutcomeKind::Approved)),
+        "the owner saves the approval"
+    );
+    let replay = run(&app, &http, check()).await;
+    assert_eq!(replay.outcome, Some(ElicitationOutcomeKind::Approved));
+    assert_eq!(http.call_count_for(TOKEN_PATH), 1);
+}
+
 // ---------------------------------------------------------------------
 // Configuration the approver has to refuse
 // ---------------------------------------------------------------------
@@ -778,6 +815,7 @@ async fn each_incomplete_ciba_config_is_refused_at_load() {
         "token_endpoint": "https://op.example/token",
         "client_id": "praxis-policy-gateway",
         "client_secret_source": { "kind": "literal", "secret": "shh" },
+        "store": { "kind": "memory" },
     });
 
     // The control: the baseline loads, so each failure below is attributable to
@@ -1001,4 +1039,210 @@ async fn a_host_refusal_is_reported_as_egress_denied() {
         1,
         "a refusal is not retried"
     );
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_record_a_dispatch_denies_as_indeterminate() {
+    let http = Arc::new(FakeTransport::new().json(
+        AUTH_PATH,
+        200,
+        &json!({ "auth_req_id": "REQ-123", "expires_in": 300 }).to_string(),
+    ));
+    let app = approver().with_store(Arc::new(FailingStore));
+    let violation = deny_for(
+        &app,
+        &http,
+        ElicitationPayload::new(ElicitationOp::Dispatch, "approval", "alice@corp.com"),
+    )
+    .await;
+
+    assert_eq!(violation.code, "elicitation.store_unavailable");
+    assert_eq!(
+        http.call_count_for(AUTH_PATH),
+        1,
+        "the human was already prompted"
+    );
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_be_read_on_check_is_not_an_unknown_id() {
+    let http = Arc::new(FakeTransport::new());
+    let app = approver().with_store(Arc::new(FailingStore));
+    let violation = deny_for(
+        &app,
+        &http,
+        ElicitationPayload::new(ElicitationOp::Check, "approval", "").with_elicitation_id("REQ-1"),
+    )
+    .await;
+
+    assert_eq!(violation.code, "elicitation.store_unavailable");
+    assert!(
+        !violation.reason.contains("down"),
+        "backend detail stays in the log: {}",
+        violation.reason
+    );
+    assert_eq!(http.call_count_for(TOKEN_PATH), 0, "no poll without state");
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_record_the_approver_denies_instead_of_approving() {
+    let http = Arc::new(FakeTransport::new().json(
+        TOKEN_PATH,
+        200,
+        &json!({ "id_token": fake_id_token("alice@corp.com") }).to_string(),
+    ));
+    let app = approver().with_store(Arc::new(FailingWrites::pending()));
+    let violation = deny_for(
+        &app,
+        &http,
+        ElicitationPayload::new(ElicitationOp::Check, "approval", "")
+            .with_elicitation_id("REQ-123"),
+    )
+    .await;
+
+    assert_eq!(violation.code, "elicitation.store_unavailable");
+}
+
+#[tokio::test]
+async fn a_store_failure_on_validate_denies_for_both_peek_and_apply() {
+    let http = Arc::new(FakeTransport::new());
+    let app = approver().with_store(Arc::new(FailingStore));
+    for peek in [true, false] {
+        let payload = ElicitationPayload::new(ElicitationOp::Validate, "approval", "")
+            .with_elicitation_id("REQ-1")
+            .with_peek(peek);
+        let violation = deny_for(&app, &http, payload).await;
+        assert_eq!(
+            violation.code, "elicitation.store_unavailable",
+            "peek={peek}"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test Utilities
+// -----------------------------------------------------------------------------
+
+/// A store whose every call fails.
+struct FailingStore;
+
+#[async_trait::async_trait]
+impl CorrelationStore for FailingStore {
+    async fn put(&self, _: &str, _: Correlation) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn get(&self, _: &str) -> Result<Option<Correlation>, StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn claim_poll(
+        &self,
+        _: &str,
+        _: &str,
+        _: Duration,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<PollClaim, StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn release_poll(&self, _: &str, _: &str) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn complete_poll(&self, _: &str, _: &str, _: String) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn abandon_poll(&self, _: &str, _: &str) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn set_resolved_approver(&self, _: &str, _: String) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn take_if_ready(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<TakeResult, StoreError> {
+        Err(StoreError::new("down"))
+    }
+}
+
+/// Reads succeed from a seeded memory store; writes fail.
+struct FailingWrites(InMemoryCorrelationStore);
+
+impl FailingWrites {
+    fn pending() -> Self {
+        let inner = InMemoryCorrelationStore::new();
+        inner.insert(
+            "REQ-123",
+            Correlation {
+                expected_approver: "alice@corp.com".into(),
+                resolved_approver: None,
+                route_key: "tool:adjust@sandbox".into(),
+                tool: "adjust".into(),
+                requester: "bob".into(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            },
+        );
+        Self(inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl CorrelationStore for FailingWrites {
+    async fn put(&self, _: &str, _: Correlation) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<Correlation>, StoreError> {
+        self.0.get(id).await
+    }
+
+    async fn claim_poll(
+        &self,
+        id: &str,
+        owner: &str,
+        lease: Duration,
+        route_key: &str,
+        tool: &str,
+        requester: &str,
+    ) -> Result<PollClaim, StoreError> {
+        self.0
+            .claim_poll(id, owner, lease, route_key, tool, requester)
+            .await
+    }
+
+    async fn release_poll(&self, id: &str, owner: &str) -> Result<(), StoreError> {
+        self.0.release_poll(id, owner).await
+    }
+
+    async fn complete_poll(&self, _: &str, _: &str, _: String) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn abandon_poll(&self, id: &str, owner: &str) -> Result<(), StoreError> {
+        self.0.abandon_poll(id, owner).await
+    }
+
+    async fn set_resolved_approver(&self, _: &str, _: String) -> Result<(), StoreError> {
+        Err(StoreError::new("down"))
+    }
+
+    async fn take_if_ready(
+        &self,
+        id: &str,
+        route_key: &str,
+        tool: &str,
+        requester: &str,
+    ) -> Result<TakeResult, StoreError> {
+        self.0.take_if_ready(id, route_key, tool, requester).await
+    }
 }

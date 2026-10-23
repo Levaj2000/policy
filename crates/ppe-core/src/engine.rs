@@ -473,6 +473,9 @@ struct RuntimeSnapshot {
     /// Executor — stateless 5-phase pipeline engine.
     executor: Executor,
 
+    /// Document-level settings used when factories build route overrides.
+    factory_context: crate::factory::FactoryContext,
+
     /// Parsed PPE config (when loaded from file). Used for route resolution.
     policy_config: Option<PolicyConfig>,
 
@@ -926,7 +929,7 @@ fn resolve_factories(
 /// Create one plugin instance per entry in `plugin_configs`, using the
 /// factories `resolve_factories` returned for those same configs.
 ///
-/// Must run with no engine lock held. `factory.create` is host code and is
+/// Must run with no engine lock held. `factory.create_with` is host code and is
 /// free to re-enter the engine: `register_handler`, `annotate_route` and
 /// `unregister_plugin` take `runtime_write`, `register_factory` takes the
 /// `factories` write side, and neither lock is reentrant, so a caller
@@ -939,11 +942,15 @@ fn resolve_factories(
 fn create_plugin_instances(
     plugin_configs: &[crate::plugin::PluginConfig],
     factories: &[Arc<dyn crate::factory::PluginFactory>],
+    context: &crate::factory::FactoryContext,
 ) -> Result<Vec<crate::factory::PluginInstance>, Box<PluginError>> {
     plugin_configs
         .iter()
         .zip(factories)
-        .map(|(plugin_config, factory)| factory.create(plugin_config))
+        .map(|(plugin_config, factory)| {
+            let scoped = context.for_plugin(factory.needs_session_store_context(plugin_config));
+            factory.create_with(plugin_config, &scoped)
+        })
         .collect()
 }
 
@@ -995,6 +1002,7 @@ fn snapshot_from_config(
     policy_config: PolicyConfig,
     prev: Option<&RuntimeSnapshot>,
     content_key: Option<crate::hooks::payload::ContentKey>,
+    factory_context: &crate::factory::FactoryContext,
 ) -> RuntimeSnapshot {
     let mut executor = Executor::new(ExecutorConfig {
         timeout_seconds: policy_config.engine_settings.plugin_timeout,
@@ -1072,6 +1080,7 @@ fn snapshot_from_config(
     RuntimeSnapshot {
         registry,
         executor,
+        factory_context: factory_context.clone(),
         policy_config: Some(policy_config),
         route_cache_max_entries,
         route_annotations: HashMap::new(),
@@ -1100,6 +1109,7 @@ impl PolicyEngine {
         let snapshot = RuntimeSnapshot {
             registry: PluginRegistry::new(),
             executor: Executor::new(config.executor),
+            factory_context: crate::factory::FactoryContext::default(),
             policy_config: None,
             route_cache_max_entries: config.route_cache_max_entries,
             route_annotations: HashMap::new(),
@@ -1381,6 +1391,14 @@ impl PolicyEngine {
     /// snapshot is left in place, so a failed load does not disturb in-flight
     /// requests.
     pub fn load_config(&self, policy_config: PolicyConfig) -> Result<(), Box<PluginError>> {
+        self.load_config_with(policy_config, &crate::factory::FactoryContext::default())
+    }
+
+    fn load_config_with(
+        &self,
+        policy_config: PolicyConfig,
+        context: &crate::factory::FactoryContext,
+    ) -> Result<(), Box<PluginError>> {
         // Warn before validating: an operator whose config both sets an inactive
         // knob and fails validation should see both, not just the refusal.
         warn_on_inactive_settings(&policy_config);
@@ -1414,7 +1432,7 @@ impl PolicyEngine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             resolve_factories(&policy_config.plugins, &registry)?
         };
-        let instances = create_plugin_instances(&policy_config.plugins, &factories)?;
+        let instances = create_plugin_instances(&policy_config.plugins, &factories, context)?;
 
         // Build the new snapshot from the current one — copy-on-write so
         // concurrent invokes keep using the existing config until we swap.
@@ -1451,6 +1469,7 @@ impl PolicyEngine {
                 policy_config,
                 Some(current.as_ref()),
                 content_key,
+                context,
             )));
             // Same generation bump as mutate_runtime — load_config doesn't
             // go through that helper because it has to swap registry + executor
@@ -1587,8 +1606,14 @@ impl PolicyEngine {
         let parsed_routes: Vec<crate::config::RouteEntry> = policy_config.routes.clone();
         let parsed_plugins: Vec<crate::plugin::PluginConfig> = policy_config.plugins.clone();
 
-        // Existing plugin-instantiation path.
-        self.load_config(policy_config)?;
+        // Existing plugin-instantiation path, with the global blocks a plugin
+        // may reference.
+        let context = crate::factory::FactoryContext::with_session_store(
+            raw.get("global")
+                .and_then(|g| g.get("session_store"))
+                .cloned(),
+        );
+        self.load_config_with(policy_config, &context)?;
 
         // Visitor walk. No-op when no visitors registered — the common
         // case for hosts that don't use the orchestrator extension point.
@@ -1724,7 +1749,11 @@ impl PolicyEngine {
 
         // Instantiate into a fresh registry, then publish atomically.
         let resolved = resolve_factories(&policy_config.plugins, factories)?;
-        let instances = create_plugin_instances(&policy_config.plugins, &resolved)?;
+        let instances = create_plugin_instances(
+            &policy_config.plugins,
+            &resolved,
+            &crate::factory::FactoryContext::default(),
+        )?;
         let mut new_registry = PluginRegistry::new();
         register_instances_into(&mut new_registry, &policy_config.plugins, &instances)?;
         let content_key = content_key_for(&policy_config, None)?;
@@ -1734,6 +1763,7 @@ impl PolicyEngine {
             policy_config,
             None,
             content_key,
+            &crate::factory::FactoryContext::default(),
         )));
 
         Ok(engine)
@@ -3340,8 +3370,9 @@ impl PolicyEngine {
             {
                 if let Some(overrides) = &resolved_plugin.config_overrides {
                     // Try to create an override instance
-                    if let Some(override_entry) =
-                        self.create_override_instance(entry, overrides).await
+                    if let Some(override_entry) = self
+                        .create_override_instance(entry, overrides, &snapshot.factory_context)
+                        .await
                     {
                         filtered.push(override_entry);
                         continue;
@@ -3514,7 +3545,7 @@ impl PolicyEngine {
     /// Returns an empty `Vec` when:
     /// - the plugin name isn't registered in the engine,
     /// - the factory for the plugin's `kind` is missing,
-    /// - the factory's `create` errors,
+    /// - the factory's `create_with` errors,
     /// - or `initialize_with()` fails on the new instance.
     ///
     /// Each of those is a configuration / wiring fault the caller
@@ -3528,7 +3559,8 @@ impl PolicyEngine {
         capabilities_override: Option<&std::collections::HashSet<String>>,
         on_error_override: Option<crate::plugin::OnError>,
     ) -> Vec<(String, crate::registry::HookEntry)> {
-        let base_entries = self.find_plugin_entries(plugin_name);
+        let snapshot = self.load_runtime();
+        let base_entries = snapshot.registry.entries_for_plugin(plugin_name);
         if base_entries.is_empty() {
             return Vec::new();
         }
@@ -3605,7 +3637,7 @@ impl PolicyEngine {
         merged_config.config = Some(cfg_json);
 
         let kind = merged_config.kind.clone();
-        // The registry lock is released before `create` runs. `create` is
+        // The registry lock is released before `create_with` runs. It is
         // host-supplied code and may re-enter the engine; taking the write side
         // while this thread still held a read guard would deadlock.
         let factory = {
@@ -3625,13 +3657,16 @@ impl PolicyEngine {
             }
         };
         let instance = {
-            match factory.create(&merged_config) {
+            let scoped = snapshot
+                .factory_context
+                .for_plugin(factory.needs_session_store_context(&merged_config));
+            match factory.create_with(&merged_config, &scoped) {
                 Ok(i) => i,
                 Err(e) => {
                     error!(
                         plugin = %plugin_name,
                         error = %e,
-                        "build_override_entries: factory.create failed",
+                        "build_override_entries: factory.create_with failed",
                     );
                     return Vec::new();
                 },
@@ -3702,6 +3737,7 @@ impl PolicyEngine {
         &self,
         base_entry: &crate::registry::HookEntry,
         overrides: &serde_json::Value,
+        factory_context: &crate::factory::FactoryContext,
     ) -> Option<crate::registry::HookEntry> {
         let base_config = base_entry.plugin_ref.trusted_config();
         let kind = &base_config.kind;
@@ -3729,7 +3765,7 @@ impl PolicyEngine {
         // read lock just long enough to construct the instance, then drop
         // it before any `.await` so we never hold a sync lock across awaits.
         let target_hook = base_entry.handler.hook_type_name();
-        // Lock released before `create`, which runs host-supplied factory code.
+        // Lock released before `create_with`, which runs host-supplied code.
         let factory = {
             let factories = self
                 .factories
@@ -3741,7 +3777,9 @@ impl PolicyEngine {
             }
         };
         let instance = {
-            match factory.create(&merged_config) {
+            let scoped =
+                factory_context.for_plugin(factory.needs_session_store_context(&merged_config));
+            match factory.create_with(&merged_config, &scoped) {
                 Ok(i) => i,
                 Err(e) => {
                     error!(
@@ -11093,6 +11131,187 @@ routes:
         let after = engine.load_runtime().executor.effect_log().unwrap();
 
         assert!(!Arc::ptr_eq(&before, &after));
+    }
+
+    /// Records the `global.session_store` block its factory was handed, then
+    /// defers to the recording factory for the instance.
+    struct ContextFactory {
+        inner: RecordingFactory,
+        seen: SeenBlocks,
+        needs_context: bool,
+    }
+
+    impl crate::factory::PluginFactory for ContextFactory {
+        fn needs_session_store_context(&self, _config: &PluginConfig) -> bool {
+            self.needs_context
+        }
+
+        fn create(
+            &self,
+            config: &PluginConfig,
+        ) -> Result<crate::factory::PluginInstance, Box<PluginError>> {
+            self.inner.create(config)
+        }
+
+        fn create_with(
+            &self,
+            config: &PluginConfig,
+            context: &crate::factory::FactoryContext,
+        ) -> Result<crate::factory::PluginInstance, Box<PluginError>> {
+            self.seen.lock().unwrap().push(
+                context
+                    .session_store()
+                    .map(|connection| connection.settings().clone()),
+            );
+            self.inner.create(config)
+        }
+    }
+
+    /// One entry per `create_with` call: the block it was handed.
+    type SeenBlocks = Arc<std::sync::Mutex<Vec<Option<serde_yaml::Value>>>>;
+
+    fn context_engine() -> (Arc<PolicyEngine>, SeenBlocks) {
+        context_engine_with_scope(true)
+    }
+
+    fn context_engine_with_scope(needs_context: bool) -> (Arc<PolicyEngine>, SeenBlocks) {
+        let seen = SeenBlocks::default();
+        let mgr = Arc::new(PolicyEngine::default());
+        mgr.register_factory(
+            "test/context",
+            Box::new(ContextFactory {
+                inner: RecordingFactory(Arc::new(std::sync::Mutex::new(Vec::new()))),
+                seen: Arc::clone(&seen),
+                needs_context,
+            }),
+        );
+        mgr.register_visitor(Arc::new(SilentVisitor));
+        (mgr, seen)
+    }
+
+    const CONTEXT_PLUGIN: &str = "
+plugins:
+  - name: observer
+    kind: test/context
+    hooks: [identity.resolve]
+    mode: sequential
+    capabilities: [read_headers]
+";
+
+    #[test]
+    fn a_factory_without_an_opt_in_receives_no_session_store() {
+        let (mgr, seen) = context_engine_with_scope(false);
+        let yaml = format!("{CONTEXT_PLUGIN}global:\n  session_store:\n    kind: memory\n");
+        load_fixture_yaml(&mgr, &yaml).expect("load");
+        assert_eq!(*seen.lock().unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn a_yaml_load_hands_factories_the_global_session_store_block() {
+        let (mgr, seen) = context_engine();
+        let yaml = format!("{CONTEXT_PLUGIN}global:\n  session_store:\n    kind: memory\n");
+        load_fixture_yaml(&mgr, &yaml).expect("load");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "create_with ran once");
+        assert_eq!(
+            seen[0]
+                .as_ref()
+                .and_then(|b| b.get("kind"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("memory"),
+            "the factory sees the raw block"
+        );
+    }
+
+    #[test]
+    fn a_yaml_load_without_a_session_store_hands_factories_none() {
+        let (mgr, seen) = context_engine();
+        load_fixture_yaml(&mgr, CONTEXT_PLUGIN).expect("load");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None],
+            "create_with ran with no block"
+        );
+    }
+
+    #[test]
+    fn a_typed_load_hands_factories_an_empty_context() {
+        let (mgr, seen) = context_engine();
+        let config: PolicyConfig = serde_yaml::from_str(CONTEXT_PLUGIN).expect("parse");
+        mgr.load_config(config).expect("load");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None],
+            "no raw document, no block"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_overrides_use_the_loaded_factory_context() {
+        register_fixture_hooks();
+        let (mgr, seen) = context_engine();
+        let yaml = format!(
+            r#"{CONTEXT_PLUGIN}engine_settings:
+  dispatch: policy
+global:
+  session_store:
+    kind: memory
+routes:
+  - tool: get_compensation
+    authentication:
+      - name: observer
+        config:
+          marker: route
+"#
+        );
+        load_fixture_yaml(&mgr, &yaml).expect("load");
+        mgr.initialize().await.expect("initialize");
+
+        let payload: Box<dyn PluginPayload> = Box::new(TestPayload { value: "t".into() });
+        let (result, _) = mgr
+            .invoke_by_name(
+                crate::identity::HOOK_IDENTITY_RESOLVE,
+                payload,
+                make_meta("tool", "get_compensation", None, &[]),
+                None,
+            )
+            .await;
+        assert!(result.continue_processing, "route override runs");
+
+        let cfg_override: serde_yaml::Value =
+            serde_yaml::from_str("marker: plan").expect("override");
+        let entries = mgr
+            .build_override_entries("observer", Some(&cfg_override), None, None)
+            .await;
+        assert!(!entries.is_empty(), "dispatch-plan override runs");
+
+        let blocks = seen.lock().unwrap().clone();
+        assert_eq!(blocks.len(), 3, "base and both override paths ran");
+        assert!(
+            blocks.iter().all(|block| {
+                block
+                    .as_ref()
+                    .and_then(|value| value.get("kind"))
+                    .and_then(serde_yaml::Value::as_str)
+                    == Some("memory")
+            }),
+            "both override paths receive the YAML session store"
+        );
+
+        mgr.load_config(PolicyConfig::default())
+            .expect("typed reload");
+        let entries = mgr
+            .build_override_entries("observer", Some(&cfg_override), None, None)
+            .await;
+        assert!(!entries.is_empty(), "override after reload runs");
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&None),
+            "typed reload clears the previous YAML context"
+        );
     }
 }
 

@@ -26,9 +26,8 @@
 //   - TLS required off-localhost; `noeviction` is an operator runbook
 //     concern the client can only warn about.
 //
-// The connection layer is kept internal (no public reusable API): the
-// planned OAuth token cache is the trigger to extract a shared layer
-// later, shaped by two real consumers.
+// The connection layer (`connection.rs`) is crate-internal and shared with
+// the CIBA correlation store: pool, timeouts, and key hashing live there.
 
 //! Valkey-backed session store for security labels.
 //!
@@ -39,7 +38,7 @@
 /// Store configuration and its validation.
 mod config;
 /// Connection setup, including TLS and authentication.
-mod connection;
+pub(crate) mod connection;
 /// Errors raised while building or reaching the store.
 mod error;
 /// Constructs the store from configuration.
@@ -47,7 +46,7 @@ mod factory;
 /// The `SessionStore` implementation.
 mod store;
 
-pub use config::ValkeyConfig;
+pub use config::{EnvPassword, FilePassword, PasswordSource, ValkeyConfig};
 pub use error::BuildError;
 pub use factory::{KIND, ValkeySessionStoreFactory};
 pub use store::ValkeySessionStore;

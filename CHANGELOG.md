@@ -19,6 +19,42 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Unavailable CIBA approval state returns `-32122`.** A store read or write
+  failure denies with `elicitation.store_unavailable` and JSON-RPC `-32122`.
+  Check and validate responses include the elicitation id to identify the
+  failed flow, including a first visit after dispatch. Store failures halt
+  even under `on_error: continue`; a failed write can still require a new elicitation.
+  `ELICITATION_UNAVAILABLE_CODE` is exported.
+  ([#236](https://github.com/praxis-proxy/policy/issues/236))
+- **CIBA approvals can be shared across replicas.** The `elicitation/ciba`
+  plugin accepts `store: { kind: memory | valkey }`. A Valkey store can use its
+  own connection or reference `global.session_store`, with overrides for
+  credentials, key prefix, and timeouts. Poll claims and redemption are atomic
+  across replicas; an ambiguous or expired poll claim requires a new elicitation.
+  ([#236](https://github.com/praxis-proxy/policy/issues/236))
+- **Valkey passwords can come from an environment variable or file.** Both
+  stores accept `password: { env: NAME }` or `{ file: PATH }` alongside a
+  string. ([#236](https://github.com/praxis-proxy/policy/issues/236))
+- `PluginFactory::create_with` receives a scoped `FactoryContext` when its
+  factory requests session-store metadata. The context contains only safe
+  connection fields. CIBA requests it for a reference and requires its own
+  password; full URL endpoints cannot be referenced. Valkey scripts use
+  `EVALSHA` with a cache-miss load. `create_with` defaults to `create`.
+  ([#236](https://github.com/praxis-proxy/policy/issues/236))
+
+- Added DPoP (RFC 9449) proof verification to `identity/jwt`, configured per
+  trusted issuer with `dpop: { mode: off | optional | required }`. A bound token
+  must carry a valid proof for the request's method and URL, signed by the key
+  in its `cnf.jkt`, and each proof is accepted once. A verified binding is
+  visible to policy as `subject.key_binding`, `client.key_binding` or
+  `caller_workload.key_binding`. The default replay guard is per instance;
+  hosts can share a store through `JwtIdentityFactory::with_replay_guard` or
+  `JwtIdentityResolver::with_replay_guard`, and the `valkey` feature supplies
+  `ValkeyReplayGuard`. The generic host-managed store service remains tracked
+  by #127. When an IdP refuses to exchange a `DPoP`-bound token,
+  `delegator/oauth`'s `delegation.idp_rejected` reason says which token was
+  bound and what to change, and names it in `details.bound_tokens`.
+  ([#204](https://github.com/praxis-proxy/policy/issues/204))
 - **`reference/plugins/transcript-scanner`** reads typed prior turns through `read_agent`, including resource blobs decoded as UTF-8 with replacement, and denies with `transcript.detected` on a configured content match. ([#70](https://github.com/praxis-proxy/policy/issues/70))
 - **`llm:` routes can read the request.** One gated `Extensions.llm_request` carrier holds the optional parsed body and normalized parts. The body reaches PDPs at `llm.request`; reported parts emit `llm.input.*` bag keys, including a role-aware instruction digest and candidate count. Model and completion facts emit canonical `llm.model.*` and `llm.output.*` keys. Published `llm.model_id`, `llm.provider`, `llm.capabilities`, and `completion.*` remain value-identical aliases. The carrier is never serialized and requires `read_llm_request` for plugins. Hosts constructing `Extensions` or `OwnedExtensions` with exhaustive literals must update them. ([#70](https://github.com/praxis-proxy/policy/issues/70))
 - **`docs/content/llm-routes.md`** documents canonical keys, missing-key behavior, host obligations, and a tested worked config. ([#70](https://github.com/praxis-proxy/policy/issues/70))
@@ -42,6 +78,32 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
   the load with the options listed, so an incomplete audit configuration no
   longer looks like a working one. `stderr` is still available and has to be
   named. ([#237](https://github.com/praxis-proxy/policy/issues/237))
+- **Breaking: CIBA config rejects unknown fields.** A misspelled key such as
+  `stroe` now fails at load and names the field.
+  ([#236](https://github.com/praxis-proxy/policy/issues/236))
+- **Breaking: CIBA config requires `store`.** An `elicitation/ciba` plugin
+  without a `store:` block now fails at load instead of keeping approvals in
+  process memory. Add `store: { kind: memory }` to keep the previous behaviour,
+  or configure `kind: valkey` to share approvals across replicas.
+  ([#236](https://github.com/praxis-proxy/policy/issues/236))
+- **Breaking Rust API changes.** `CorrelationStore` is async and fallible, and
+  implementers must provide `claim_poll`, `release_poll`, `complete_poll`, and
+  `abandon_poll`;
+  `ValkeyConfig.password` is a `PasswordSource`, and `CibaConfig` has a `store`
+  field. Construct `StoreError` with `StoreError::new`;
+  `ValkeyCorrelationStore::from_settings` returns `SettingsError`.
+  Build `ValkeyConfig` with `from_value` so its password is resolved and
+  validated once before pool construction; direct struct literals are no
+  longer available.
+  `FactoryContext`, `StoreConfig`, `PasswordSource`, and `SettingsError` are
+  `#[non_exhaustive]`. Trait implementations, config struct literals, and
+  exhaustive matches may need updates.
+  ([#236](https://github.com/praxis-proxy/policy/issues/236))
+
+- **Breaking:** `SubjectExtension`, `ClientExtension`, and `WorkloadIdentity`
+  add `key_binding`. Hosts using exhaustive struct literals must initialize it
+  or use `..Default::default()`. `TrustedIssuerConfig` adds `dpop`; exhaustive
+  literals must set it, for example to `DpopConfig::default()`.
 - **Breaking: `ConversationContext.history` is `Vec<Message>`, was `Vec<serde_json::Value>`.** Each entry is a CMF message, the same type as the current turn's payload. A host that sent free-form summary objects must now send turns in CMF message shape; anything else fails to deserialize rather than being carried unread. History is still not flattened into the attribute bag; policy reaches it through a plugin. ([#70](https://github.com/praxis-proxy/policy/issues/70))
 - **Breaking:** `Extensions` and `OwnedExtensions` add `metadata`; exhaustive
   struct literals must initialize it (or use `..Default::default()`).
