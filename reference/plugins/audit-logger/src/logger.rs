@@ -30,16 +30,11 @@ pub struct AuditLogger {
 impl AuditLogger {
     /// # Errors
     ///
-    /// Returns `PluginError::Config` when the `config:` block names no
-    /// `destination`, or does not parse. A missing destination is an error
-    /// rather than a stderr fallback, so an entry with no output configured
-    /// fails the load instead of looking like a working audit sink
-    /// ([#237]).
-    ///
-    /// [#237]: https://github.com/praxis-proxy/policy/issues/237
+    /// Returns `PluginError::Config` when `destination` is absent or invalid,
+    /// or the `config:` block does not parse.
     pub fn new(cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
         let raw = match cfg.config.as_ref() {
-            Some(raw) if raw.get("destination").is_some() => raw,
+            Some(raw) if raw.get("destination").is_some_and(|value| !value.is_null()) => raw,
             _ => {
                 return Err(Box::new(PluginError::Config {
                     message: format!(
@@ -613,7 +608,9 @@ mod tests {
         absent.config = None;
         let mut silent = cfg();
         silent.config = Some(serde_json::json!({ "source": "gateway-eu-1" }));
-        for c in [absent, silent] {
+        let mut blank = cfg();
+        blank.config = Some(serde_json::json!({ "destination": null }));
+        for c in [absent, silent, blank] {
             let err =
                 AuditLogger::new(c).expect_err("an entry without a destination must not build");
             let msg = err.to_string();

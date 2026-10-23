@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// Operator-facing config for the OCSF audit sink. Follows the audit-logger
-// config style (serde, snake_case enums, an explicit destination) and adds
-// the OCSF and attestation settings.
-
 //! Operator configuration: exporters, product identity, chaining and
 //! signing.
 
@@ -20,34 +16,25 @@ use crate::emitter::TracingExporter;
 // Constants
 // -----------------------------------------------------------------------------
 
-/// The error for an entry that names no output at all. Lists every option
-/// so the operator can finish the entry from the message alone.
 const MISSING_OUTPUT: &str = "no audit destination configured; set `destination: stderr` or \
                               `destination: tracing`, or list `exporters` (kinds: stderr, \
                               stdout, file, tracing)";
 
 /// The `config:` block of an `audit/ocsf` plugin entry.
 ///
-/// `Default` is written out below rather than derived, so that the defaults
-/// an entry gets by omitting the whole `config:` block are the ones
-/// documented on the fields.
+/// `destination` or `exporters` must be set before the sink can load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcsfAuditConfig {
     /// Where OCSF events go, as a single destination: `stderr` or
     /// `tracing`. Mutually exclusive with `exporters`, which can name
-    /// several. One of the two is required: with neither set the sink
-    /// refuses to load, so an audit entry that names no output is never
-    /// mistaken for one that works. `stderr` keeps the demo flow
-    /// (`docker compose logs -f | jq`) identical to audit-logger, but it
-    /// is a choice the entry has to make.
+    /// several. One of the two is required.
     #[serde(default)]
     pub destination: Option<OcsfDestination>,
 
     /// Where OCSF events go, as a list of exporters. Every record is
     /// written, byte for byte, to each one. Mutually exclusive with
-    /// `destination`, and required when `destination` is unset; an empty
-    /// list is rejected.
+    /// `destination`; an empty list is rejected.
     ///
     /// ```yaml
     /// exporters:
@@ -83,7 +70,7 @@ pub struct OcsfAuditConfig {
     /// `<chain_uid>-<seq>`, so the uids are unique only within that
     /// process. Two processes sharing a configured `chain_uid`, a restart
     /// or a replica, mint colliding uids, and a consumer deduplicating by
-    /// `metadata.uid` (AID-EMIT-1 section 6) discards the later records as
+    /// `metadata.uid` discards the later records as
     /// replays. Give every process its own value, or leave it unset and
     /// take the per-process default.
     #[serde(default)]
@@ -123,8 +110,7 @@ pub struct OcsfAuditConfig {
     /// so a verifier can resolve the public key from the authority's
     /// published key set. Rides in `unmapped`, outside the hashed bytes
     /// like the signature itself, because `digital_signature` has no
-    /// member for signature material; that gap is filed as
-    /// ocsf-schema#1709.
+    /// member for signature material.
     #[serde(default)]
     pub signing_key_id: Option<String>,
 
@@ -149,12 +135,6 @@ pub struct OcsfAuditConfig {
 }
 
 impl Default for OcsfAuditConfig {
-    /// The same values the `#[serde(default ...)]` attributes above supply,
-    /// through the same functions. A derived `Default` would give `chain`
-    /// and `include_gap_fields` as `false`, which is not what the fields
-    /// say and not what an entry with a `config: {}` block gets: a sink
-    /// running on its defaults would emit records with no attestation, no
-    /// fingerprint and no signature, and nothing would say so.
     fn default() -> Self {
         Self {
             destination: None,
@@ -183,8 +163,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Where a record is written. No variant is the default: an entry picks one
-/// or lists `exporters`.
+/// Where a record is written when `destination` is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OcsfDestination {
@@ -254,13 +233,8 @@ impl OcsfAuditConfig {
     ///
     /// # Errors
     ///
-    /// Neither `destination` nor `exporters` set, both set, an empty
-    /// `exporters` list, or an exporter that cannot be opened. The missing
-    /// case is an error rather than a stderr fallback so that an entry
-    /// with no output configured fails the load instead of looking like a
-    /// working audit sink ([#237]).
-    ///
-    /// [#237]: https://github.com/praxis-proxy/policy/issues/237
+    /// Returns an error if neither output is set, both are set, the exporter
+    /// list is empty, or an exporter cannot be opened.
     pub fn build_exporters(&self) -> Result<Vec<Arc<dyn AuditExporter>>, ExportError> {
         match (&self.destination, &self.exporters) {
             (None, None) => Err(ExportError::Config(MISSING_OUTPUT.to_owned())),

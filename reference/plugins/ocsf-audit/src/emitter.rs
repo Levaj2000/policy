@@ -125,13 +125,12 @@ impl std::fmt::Debug for OcsfAuditEmitter {
 }
 
 impl OcsfAuditEmitter {
-    /// Parse the plugin's `config:` block and build the signer.
+    /// Build an audit sink from a plugin entry.
     ///
     /// # Errors
     ///
-    /// A config that does not parse, or `signing: dsse` with no key, both
-    /// keys, or a key that cannot be read or parsed. A missing key fails
-    /// here rather than falling back to unsigned records.
+    /// Returns an error for invalid configuration, a missing output, an
+    /// unavailable exporter, or invalid signing keys.
     pub fn new(mut cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
         let mut typed: OcsfAuditConfig = match cfg.config.as_ref() {
             Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
@@ -142,9 +141,6 @@ impl OcsfAuditEmitter {
                     ),
                 })
             })?,
-            // No `config:` block at all. `OcsfAuditConfig`'s hand-written
-            // `Default` carries the documented field defaults, chaining
-            // included, so this path and a `config: {}` block agree.
             None => OcsfAuditConfig::default(),
         };
 
@@ -658,11 +654,6 @@ mod tests {
     use praxis_policy_core::plugin::{OnError, PluginMode};
     use std::collections::HashMap;
 
-    /// A plugin entry with `extra` as its `config:` block. The sink refuses
-    /// to load without an output, so a block that names neither
-    /// `destination` nor `exporters` gets `destination: stderr`, the way an
-    /// operator would write it; tests about the output itself set one
-    /// explicitly.
     fn cfg(mut extra: serde_json::Value) -> PluginConfig {
         if let Some(block) = extra.as_object_mut()
             && !block.contains_key("destination")
