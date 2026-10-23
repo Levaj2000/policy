@@ -42,20 +42,54 @@ use testcontainers_modules::valkey::{VALKEY_PORT, Valkey};
 
 /// A Valkey endpoint to test against, plus the container handle when one
 /// was started (kept alive for the test's duration).
-struct Target {
-    url: String,
+pub(crate) struct Target {
+    pub(crate) url: String,
     _container: Option<ContainerAsync<Valkey>>,
 }
 
 /// Resolve a Valkey target, or skip loudly when none is available.
 /// Returns `None` to signal the caller should return early (skip).
-async fn valkey_target() -> Option<Target> {
+pub(crate) async fn valkey_target() -> Option<Target> {
     if let Ok(url) = std::env::var("VALKEY_TEST_URL") {
         return Some(Target {
             url,
             _container: None,
         });
     }
+    container_target("VALKEY_TEST_URL").await
+}
+
+/// The script-cache test flushes all scripts on its server, so it needs an
+/// endpoint that no other test uses.
+#[cfg(feature = "elicitation-ciba")]
+pub(crate) async fn isolated_valkey_target() -> Option<Target> {
+    if let Ok(url) = std::env::var("VALKEY_SCRIPT_TEST_URL") {
+        if let Ok(shared_url) = std::env::var("VALKEY_TEST_URL") {
+            let endpoint = |address: &str| {
+                let parsed = url::Url::parse(address).expect("valid Valkey test URL");
+                (
+                    parsed
+                        .host_str()
+                        .expect("Valkey test URL has a host")
+                        .to_owned(),
+                    parsed.port().unwrap_or(6379),
+                )
+            };
+            assert_ne!(
+                endpoint(&url),
+                endpoint(&shared_url),
+                "VALKEY_SCRIPT_TEST_URL must use a different server from VALKEY_TEST_URL"
+            );
+        }
+        return Some(Target {
+            url,
+            _container: None,
+        });
+    }
+    container_target("VALKEY_SCRIPT_TEST_URL").await
+}
+
+async fn container_target(url_variable: &str) -> Option<Target> {
     match Valkey::default().start().await {
         Ok(node) => {
             let host = node.get_host().await.expect("container host");
@@ -77,7 +111,7 @@ async fn valkey_target() -> Option<Target> {
                 "no Valkey available: {e}\n  \
                  These tests are #[ignore]d, so running them is an explicit request and \
                  skipping silently would report success without asserting anything.\n  \
-                 Provide one with VALKEY_TEST_URL=redis://host:port, or start Docker so \
+                 Provide one with {url_variable}=redis://host:port, or start Docker so \
                  testcontainers can, or set VALKEY_TESTS_OPTIONAL=1 to skip on purpose."
             );
         },

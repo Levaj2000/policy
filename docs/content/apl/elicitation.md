@@ -94,6 +94,7 @@ plugins:
         kind: file
         path: /etc/ppe-secrets/client-secret
       approver_claim: preferred_username
+      store: { kind: memory }
 ```
 
 `from` becomes the CIBA `login_hint`, `purpose` seeds the `binding_message`, and
@@ -145,10 +146,199 @@ response body, which may contain client credentials. A successful non-peek
 validation consumes it atomically, so a
 second application fails; an `X-Policy-Elicitation-Peek` request checks without
 consuming and can be followed by one application. If a later step fails after
-validation, the id is still spent. Correlations expire and are held in this
-process's memory. A restart loses pending approvals, and a retry on another
-replica cannot find them; route approval retries to the same process until a
-shared durable store is available.
+validation, the id is still spent. Correlations expire on their own.
+
+## Correlation store
+
+CIBA keeps pending approvals between requests. Select the correlation store
+with the plugin's `store:` block:
+
+- `kind: memory` holds approvals in this process. A restart loses them, and a
+  retry on another replica cannot find them.
+- `kind: valkey` shares them across replicas and survives gateway restarts.
+  Claiming an OP poll and redeeming are atomic, so two replicas cannot poll
+  the same single-use ID concurrently or both apply one approval.
+
+`store:` is required. Choose `store: { kind: memory }` for process-local
+approvals, or configure Valkey to share them across replicas. An omitted
+selection fails configuration loading.
+`global.session_store` configures Session Taint only. It does not move CIBA
+approvals unless a `store:` block references it.
+
+The store holds the expected and actual approver, never a token. A user with
+write access to CIBA keys can mark an approval as given. Keys use
+`<key_prefix>:<plugin name>:<digest>`, so replicas of the same plugin share
+approvals and different plugins use different keys. The prefix prevents key
+collisions. Separate Valkey ACL users restrict access to each store's keys.
+
+### Shared server, separate ACL user
+
+For a shared Valkey server, reference the session store's endpoint and TLS
+with `connection: session_store`, then set separate CIBA credentials and a key
+prefix:
+
+```yaml
+global:
+  session_store:
+    kind: valkey
+    endpoint: valkey.internal:6380
+    tls: true
+    username: ppe-taint
+    password: { env: PPE_TAINT_VALKEY_PASSWORD }
+
+plugins:
+  - name: manager-approver
+    kind: elicitation/ciba
+    hooks: [elicit]
+    capabilities: [perform_http]
+    config:
+      backchannel_endpoint: https://kc/realms/corp/protocol/openid-connect/ext/ciba/auth
+      token_endpoint: https://kc/realms/corp/protocol/openid-connect/token
+      client_id: praxis-policy-gateway
+      client_secret_source: { kind: env_var, name: CIBA_CLIENT_SECRET }
+      store:
+        kind: valkey
+        connection: session_store
+        username: ppe-ciba
+        password: { file: /run/secrets/ciba-valkey-password }
+        key_prefix: ciba:v1
+```
+
+A reference requires its own `password`; `username` is optional for a Valkey
+default user. A password alone does not separate CIBA from Session Taint: when
+neither block sets a `username`, both authenticate as the default user and share
+its ACL, so CIBA can read and delete taint keys. Isolation needs a `username`
+that differs from the session store's. A reference may also set `key_prefix`, `connect_timeout_ms`, and
+`command_timeout_ms`. The global endpoint must be a bare `host:port` with
+separate credentials: full URL endpoints cannot be referenced. Use the
+standalone form for a different server. A reference fails to load when
+`global.session_store` is absent or is not `kind: valkey`. Hosts must load the
+document with `load_config_yaml`, the loader that reads `global.session_store`.
+
+Create each Valkey user with access to its store's keys and commands. PPE does
+not create or check ACL users. Run these commands with an administrator account
+on the shared server:
+
+```console
+valkey-cli -h valkey.internal -p 6380 --tls ACL SETUSER ppe-taint reset on \
+  '>taint-password' '~taint:v1:*' resetchannels +sadd +smembers +expire \
+  +multi +exec +ping +unwatch '+client|setinfo'
+valkey-cli -h valkey.internal -p 6380 --tls ACL SETUSER ppe-ciba reset on \
+  '>ciba-password' '~ciba:v1:*' resetchannels +hmset +hgetall +hset \
+  +pexpire +del +exists +hget +hexists +hdel +time +multi +exec \
+  +evalsha '+script|load' +ping +unwatch '+client|setinfo'
+```
+
+`reset` starts each user from nothing, so it holds only the commands listed:
+
+| Commands | Why |
+|----------|-----|
+| `sadd`, `smembers`, `expire` | Session Taint labels and their TTL |
+| `hmset`, `hgetall`, `pexpire`, `del` | CIBA correlations and their expiry |
+| `evalsha`, `script\|load` | Run cached CIBA scripts and load them after a cache miss |
+| `exists`, `hset`, `hget`, `hexists`, `hdel`, `time` | Poll claim, redeem, and resolve script commands |
+| `multi`, `exec` | Both stores write inside a transaction |
+| `ping`, `unwatch` | Pool connection checks; without them, each request opens a new connection |
+| `client\|setinfo` | Client identification; denying it fills the ACL log |
+
+A missing data command fails closed: the session store errors and CIBA denies
+with `elicitation.store_unavailable`. With these users, stolen taint
+credentials cannot forge an approver, and stolen CIBA credentials cannot clear
+Session Taint labels. Neither user can read the other's keys, list the
+keyspace, or run commands outside its list.
+
+### Separate server
+
+Use a standalone block to give CIBA its own Valkey server, endpoint, TLS
+settings, and credentials:
+
+```yaml
+plugins:
+  - name: manager-approver
+    kind: elicitation/ciba
+    hooks: [elicit]
+    capabilities: [perform_http]
+    config:
+      backchannel_endpoint: https://kc/realms/corp/protocol/openid-connect/ext/ciba/auth
+      token_endpoint: https://kc/realms/corp/protocol/openid-connect/token
+      client_id: praxis-policy-gateway
+      client_secret_source: { kind: env_var, name: CIBA_CLIENT_SECRET }
+      store:
+        kind: valkey
+        endpoint: valkey-ciba.internal:6380
+        tls: true
+        username: ppe-ciba
+        password: { env: CIBA_VALKEY_PASSWORD }
+```
+
+Choose it when approvals need their own failure domain, `noeviction` policy,
+retention, or backups, so a full taint store cannot evict pending approvals.
+The standalone form takes the same settings as `global.session_store`. TLS is
+required off localhost, and the default key prefix is `ciba:v1`.
+
+### Unauthenticated local Valkey
+
+For a local server without AUTH, use a standalone CIBA connection with its own
+`endpoint: localhost:6379`. A reference requires CIBA credentials and will
+refuse an omitted password at configuration load.
+
+### Store failures
+
+If Valkey is unreachable, times out, or returns undecodable data, the step
+denies with `elicitation.store_unavailable` and JSON-RPC `-32122` ("approval
+state unavailable") even with `on_error: continue`. The failure is neither an
+unknown id nor an approval. The caller sees a generic reason. The backend
+error is logged with `alarm = "ciba_store_unavailable"`, the plugin, and the
+operation. If a dispatch reached the OP before a store failure, the log also
+includes the `auth_req_id` because the approver has already been prompted.
+
+The `-32122` details echo `elicitation_id` when dispatch produced one or the
+request supplied one. It
+identifies the failed flow, but does not guarantee a same-id retry. A failed
+read before polling the OP can be retried after the store recovers. If the OP
+approved a poll but the write of the resolved approver failed, the write may
+or may not have persisted. When it did not, the OP has already spent the
+`auth_req_id`; the approval is lost and a new elicitation is required. A
+failed redemption during validate may also have consumed the approval. A
+dispatch has no id yet, so retrying it may prompt the approver again.
+
+A poll whose outcome is unknown also ends the flow. The checker holds a claim
+on the id while it polls the OP. If that poll fails after it may have reached
+the OP, returns an unreadable answer, or outlives its claim, the id is marked
+uncertain and is never polled again, since the OP may have spent the
+`auth_req_id`. A request cancelled mid-poll, such as a client disconnect or
+replica shutdown, leaves its claim in place. Another check returns pending
+(`-32120`) while the claim is live. If the poll never completes, the next check
+after the lease expires marks the id uncertain and returns `-32122`; later
+checks return `-32122` until the approval expires. This can happen even when
+the cancelled poll was never sent. An agent that receives `-32122` repeatedly
+for the same id should stop retrying it and start a new elicitation.
+
+The pool connects on first use. An unreachable server, wrong credentials, or
+a missing ACL grant may therefore first appear as `-32122` on an approval.
+Before taking traffic, check connectivity and credentials from the gateway
+host using the endpoint, TLS setting, user, and password source configured for
+CIBA in the shared-server example:
+
+```console
+REDISCLI_AUTH="$(cat /run/secrets/ciba-valkey-password)" \
+  valkey-cli -h valkey.internal -p 6380 --tls --user ppe-ciba -e PING
+```
+
+Expect `PONG`. For a standalone store, use its configured endpoint and
+password source instead. The ACL test in [Testing](../testing.md) checks the
+data-command grants.
+
+### Durability
+
+Single use holds only while Valkey keeps acknowledged writes. A redeemed
+approval comes back if the server restarts from an older snapshot, or fails
+over to a replica that had not received the delete. For approvals that must
+not be replayed, run the CIBA store with `appendonly yes` and
+`appendfsync always`, and without failover to an asynchronous replica. Use
+`noeviction` so memory pressure drops new writes instead of pending
+approvals. A restart that loses data fails closed: pending approvals read as
+an unknown id.
 
 ## Pipeline integration
 

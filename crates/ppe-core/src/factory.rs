@@ -58,6 +58,134 @@ pub trait PluginFactory: Send + Sync {
     /// Returns `PluginError::Config` when the entry's settings are missing,
     /// malformed, or out of range for this plugin.
     fn create(&self, config: &PluginConfig) -> Result<PluginInstance, Box<PluginError>>;
+
+    /// Request safe session-store connection settings for this plugin entry.
+    /// The default keeps document-level settings out of unrelated factories.
+    fn needs_session_store_context(&self, _config: &PluginConfig) -> bool {
+        false
+    }
+
+    /// Create a plugin with document-level settings it may reference.
+    ///
+    /// Defaults to [`Self::create`]. Override only when the plugin's config can
+    /// point at a global block, such as `global.session_store`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    ///
+    /// [`Self::create`]: PluginFactory::create
+    fn create_with(
+        &self,
+        config: &PluginConfig,
+        _context: &FactoryContext,
+    ) -> Result<PluginInstance, Box<PluginError>> {
+        self.create(config)
+    }
+}
+
+/// Document-level settings passed to [`PluginFactory::create_with`].
+///
+/// `load_config_yaml` fills this context. The typed `load_config` path passes
+/// an empty context.
+///
+/// [`PluginFactory::create_with`]: PluginFactory::create_with
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct FactoryContext {
+    session_store: Option<SessionStoreConnection>,
+}
+
+impl FactoryContext {
+    /// Keep only non-secret connection settings from `global.session_store`.
+    #[must_use]
+    pub fn with_session_store(session_store: Option<serde_yaml::Value>) -> Self {
+        Self {
+            session_store: session_store.map(|block| SessionStoreConnection::from_block(&block)),
+        }
+    }
+
+    /// Safe session-store connection settings, when the document has one.
+    pub fn session_store(&self) -> Option<&SessionStoreConnection> {
+        self.session_store.as_ref()
+    }
+
+    pub(crate) fn for_plugin(&self, requested: bool) -> Self {
+        if requested {
+            self.clone()
+        } else {
+            Self::default()
+        }
+    }
+}
+
+impl std::fmt::Debug for FactoryContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FactoryContext")
+            .field("has_session_store", &self.session_store.is_some())
+            .finish()
+    }
+}
+
+/// Non-secret connection metadata from a global session store.
+#[derive(Clone)]
+pub struct SessionStoreConnection {
+    settings: serde_yaml::Value,
+    url_endpoint: bool,
+}
+
+impl SessionStoreConnection {
+    fn from_block(block: &serde_yaml::Value) -> Self {
+        let mut safe = serde_yaml::Mapping::new();
+        let mut url_endpoint = false;
+        for key in [
+            "kind",
+            "endpoint",
+            "tls",
+            "connect_timeout_ms",
+            "command_timeout_ms",
+        ] {
+            let Some(value) = block.get(key) else {
+                continue;
+            };
+            if key == "endpoint" {
+                // Full URLs can carry userinfo, query parameters, or fragments.
+                // References require a bare endpoint with separate credentials.
+                if value.as_str().is_none_or(|endpoint| {
+                    endpoint.contains("://")
+                        || endpoint.contains(['@', '?', '#', '/', '\\'])
+                        || endpoint.chars().any(char::is_whitespace)
+                }) {
+                    url_endpoint = true;
+                    continue;
+                }
+            }
+            safe.insert(serde_yaml::Value::String(key.to_owned()), value.clone());
+        }
+        Self {
+            settings: serde_yaml::Value::Mapping(safe),
+            url_endpoint,
+        }
+    }
+
+    /// The safe fields used to build a separate plugin connection.
+    pub fn settings(&self) -> &serde_yaml::Value {
+        &self.settings
+    }
+
+    /// Whether the global endpoint uses URL syntax or contains userinfo.
+    /// Such endpoints cannot be referenced with separate plugin credentials.
+    pub fn has_url_endpoint(&self) -> bool {
+        self.url_endpoint
+    }
+}
+
+impl std::fmt::Debug for SessionStoreConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionStoreConnection")
+            .field("url_endpoint", &self.url_endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A created plugin instance — the plugin and its type-erased handlers.
@@ -171,6 +299,34 @@ mod tests {
                 message: format!("stub {}", self.0),
             }))
         }
+    }
+
+    #[test]
+    fn session_store_context_excludes_credentials_and_scopes_access() {
+        let raw = serde_yaml::from_str(
+            "kind: valkey\nendpoint: localhost:6379\nusername: taint\npassword: inline-secret\ntls: true\nkey_prefix: taint:v1\n",
+        )
+        .unwrap();
+        let context = FactoryContext::with_session_store(Some(raw));
+        let connection = context.session_store().unwrap();
+        let safe = serde_yaml::to_string(connection.settings()).unwrap();
+        assert!(safe.contains("localhost:6379"));
+        assert!(!safe.contains("inline-secret"));
+        assert!(!safe.contains("username"));
+        assert!(!safe.contains("key_prefix"));
+        assert!(!format!("{context:?}").contains("inline-secret"));
+        assert!(context.for_plugin(false).session_store().is_none());
+        assert!(context.for_plugin(true).session_store().is_some());
+
+        let url = serde_yaml::from_str(
+            "kind: valkey\nendpoint: redis://user:url-secret@localhost:6379\n",
+        )
+        .unwrap();
+        let context = FactoryContext::with_session_store(Some(url));
+        let connection = context.session_store().unwrap();
+        assert!(connection.has_url_endpoint());
+        assert!(connection.settings().get("endpoint").is_none());
+        assert!(!format!("{context:?} {connection:?}").contains("url-secret"));
     }
 
     #[test]

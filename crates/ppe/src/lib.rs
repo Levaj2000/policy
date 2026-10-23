@@ -89,7 +89,7 @@ pub use praxis_policy_core::engine::PolicyEngine;
 /// Surfaced here so a host embedding the engine can name them without reaching
 /// through to `praxis_policy_core`. Plugin *authors* get the same two names from
 /// [`prelude`].
-pub use praxis_policy_core::factory::{PluginFactory, PluginInstance};
+pub use praxis_policy_core::factory::{FactoryContext, PluginFactory, PluginInstance};
 
 /// What a host needs to give the engine its secrets.
 ///
@@ -157,7 +157,8 @@ pub use praxis_policy_builtins::secrets::vault::{
 };
 #[cfg(feature = "valkey")]
 pub use praxis_policy_builtins::session::valkey::{
-    KIND as VALKEY_KIND, ValkeyConfig, ValkeySessionStoreFactory,
+    KIND as VALKEY_KIND, PasswordSource as ValkeyPasswordSource, ValkeyConfig,
+    ValkeySessionStoreFactory,
 };
 
 // =============================================================================
