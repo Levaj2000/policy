@@ -144,8 +144,7 @@ impl OcsfAuditEmitter {
             })?,
             // No `config:` block at all. `OcsfAuditConfig`'s hand-written
             // `Default` carries the documented field defaults, chaining
-            // included, so this path and a `config: {}` block agree: both
-            // name no output, and both fail just below for that reason.
+            // included, so this path and a `config: {}` block agree.
             None => OcsfAuditConfig::default(),
         };
 
@@ -1033,10 +1032,6 @@ mod tests {
         assert!(ev["unmapped"]["signature_b64"].is_string());
     }
 
-    /// A `plugins:` entry that names only its output takes every other
-    /// field's documented default. The sink must still chain there: an
-    /// unattested record carries no fingerprint and no signature, and
-    /// nothing in it says the integrity seam was off.
     #[test]
     fn a_destination_only_config_block_takes_the_documented_defaults() {
         let e = OcsfAuditEmitter::new(cfg(json!({ "destination": "stderr" }))).unwrap();
@@ -2029,10 +2024,6 @@ mod tests {
         }
     }
 
-    /// An entry with no output at all used to fall back to stderr, which
-    /// made a half-written audit entry look like a working one. It now
-    /// fails the load, whether the `config:` block is absent or merely
-    /// silent, and the message names every option (#237).
     #[test]
     fn with_no_destination_or_exporters_the_sink_refuses_to_load() {
         let err = OcsfAuditConfig::default().build_exporters().unwrap_err();
@@ -2093,7 +2084,6 @@ mod tests {
         let a = dir.0.join("a.ndjson");
         let b = dir.0.join("b.ndjson");
         let mut extra = signed_cfg().config.unwrap();
-        // `cfg` named stderr; the files replace it rather than join it.
         extra.as_object_mut().unwrap().remove("destination");
         extra["exporters"] = json!([
             { "kind": "file", "path": a, "fsync": "batch" },

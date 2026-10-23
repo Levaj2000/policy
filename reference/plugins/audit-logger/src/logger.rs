@@ -607,10 +607,6 @@ mod tests {
         assert_eq!(record["source"], "edge-gateway-1");
     }
 
-    /// With no `config:` block, or one that names no `destination`, the
-    /// plugin used to take stderr silently, which made a half-written audit
-    /// entry look like a working one. Both now fail the load with a message
-    /// that lists the options (#237).
     #[test]
     fn a_missing_destination_is_rejected_with_the_options_listed() {
         let mut absent = cfg();
@@ -627,7 +623,6 @@ mod tests {
         }
     }
 
-    /// `stderr` is still available; it just has to be named.
     #[test]
     fn an_explicit_stderr_destination_builds() {
         let plugin = AuditLogger::new(cfg()).expect("destination: stderr must build");
