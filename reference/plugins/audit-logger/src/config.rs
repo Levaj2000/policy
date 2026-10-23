@@ -3,8 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Audit logger settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Audit logger settings. Plugin entries must set `destination` explicitly.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AuditLoggerConfig {
     /// Where audit records go: `stderr` or the host's `tracing` subscriber.
     pub destination: AuditDestination,
@@ -17,10 +17,11 @@ pub struct AuditLoggerConfig {
 }
 
 /// Where audit records are written.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditDestination {
     /// Write one JSON line per call to stderr.
+    #[default]
     Stderr,
     /// Emit via `tracing::info!` at target `apl.audit`. Routed by
     /// the host's subscriber to wherever traces normally go.

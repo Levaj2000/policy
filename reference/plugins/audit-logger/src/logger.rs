@@ -623,7 +623,11 @@ mod tests {
     #[test]
     fn an_explicit_stderr_destination_builds() {
         let plugin = AuditLogger::new(cfg()).expect("destination: stderr must build");
-        assert_eq!(plugin.typed.destination, AuditDestination::Stderr);
+        assert_eq!(
+            plugin.typed.destination,
+            AuditDestination::Stderr,
+            "an explicit stderr destination must select stderr"
+        );
         let record = plugin.build_record(Some(&empty_payload()), &Extensions::default());
         assert!(
             record.get("source").is_none(),

@@ -2047,10 +2047,18 @@ mod tests {
     fn an_explicit_destination_is_the_one_exporter() {
         let stderr: OcsfAuditConfig =
             serde_json::from_value(json!({ "destination": "stderr" })).unwrap();
-        assert_eq!(exporter_names(&stderr), ["stderr"]);
+        assert_eq!(
+            exporter_names(&stderr),
+            ["stderr"],
+            "destination: stderr must build one stderr exporter"
+        );
         let tracing: OcsfAuditConfig =
             serde_json::from_value(json!({ "destination": "tracing" })).unwrap();
-        assert_eq!(exporter_names(&tracing), ["tracing"]);
+        assert_eq!(
+            exporter_names(&tracing),
+            ["tracing"],
+            "destination: tracing must build one tracing exporter"
+        );
     }
 
     #[test]

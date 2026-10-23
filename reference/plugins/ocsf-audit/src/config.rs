@@ -164,10 +164,11 @@ fn default_true() -> bool {
 }
 
 /// Where a record is written when `destination` is set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OcsfDestination {
     /// One OCSF JSON object per line to stderr.
+    #[default]
     Stderr,
     /// Emit via `tracing::info!` at target `ocsf.audit`.
     Tracing,
