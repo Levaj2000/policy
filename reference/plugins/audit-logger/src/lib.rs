@@ -14,10 +14,11 @@
 // who want to halt on audit failure would compose this with a
 // downstream policy step.
 //
-// Output:
+// Output, chosen by a required `destination:` (an entry that names none
+// fails the load rather than writing somewhere nobody picked):
 //
-//   * `destination: stderr` (default) — one JSON line per call,
-//     handy for the demo's `docker compose logs -f` flow.
+//   * `destination: stderr` — one JSON line per call, handy for the
+//     demo's `docker compose logs -f` flow.
 //   * `destination: tracing` — emit as a structured `tracing::info!`
 //     so it lands in whatever the host's subscriber routes to.
 //

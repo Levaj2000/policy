@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! What `DPoP` adds to a request (`identity/jwt`, praxis-proxy/policy#204).
+//! What `DPoP` adds to an `identity/jwt` request.
 //!
 //! A `DPoP` request costs a normal token validation plus two things this target
 //! isolates:

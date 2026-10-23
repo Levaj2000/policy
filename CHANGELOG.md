@@ -72,6 +72,12 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Breaking for the reference audit plugins:** `audit/logger` requires
+  `destination:` and `audit/ocsf` requires `destination:` or `exporters:`.
+  Neither falls back to stderr any more: an entry that names no output fails
+  the load with the options listed, so an incomplete audit configuration no
+  longer looks like a working one. `stderr` is still available and has to be
+  named. ([#237](https://github.com/praxis-proxy/policy/issues/237))
 - **Breaking: CIBA config rejects unknown fields.** A misspelled key such as
   `stroe` now fails at load and names the field.
   ([#236](https://github.com/praxis-proxy/policy/issues/236))

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Isolated heap measurements (issue #19 — Memory).
+//! Isolated heap measurements.
 //!
 //! Unlike the Criterion `memory` target, this binary runs a **fixed** number of
 //! decisions under `dhat` so totals are attributable:

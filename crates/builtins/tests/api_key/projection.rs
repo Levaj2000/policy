@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! Record fields onto the identity slots, through the shared mapper.
+//!
+//! The raw credential checks cover only fields this resolver writes. The
+//! inbound header map is still serialized in `IdentityPayload`, including
+//! credentials supplied by a caller.
 
 use crate::support::{RecordFile, denial_code, file_config, hash, resolve_with_header, resolver};
 
@@ -122,14 +126,6 @@ fn a_map_with_no_section_for_the_role_fails_at_config_load() {
     );
 }
 
-/// The presented credential stops at this plugin. Nothing downstream can
-/// forward a caller's own key to an upstream that never authenticated it.
-///
-/// Scoped to what this resolver writes. The credential does still reach a
-/// serialized `IdentityPayload`, through the inbound header map that the host
-/// populates and `IdentityPayload` serializes in full. That is core's, it
-/// predates this plugin, and it applies to a Bearer JWT exactly as much as to
-/// an API key. See `scratchpad/issues/identity-and-delegation/issue-credentials-as-octets.md`.
 #[tokio::test]
 async fn the_presented_credential_never_reaches_raw_credentials() {
     let file = RecordFile::write(&format!(

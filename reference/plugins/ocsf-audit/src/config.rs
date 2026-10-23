@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-// Operator-facing config for the OCSF audit sink. Follows the audit-logger
-// config style (serde, snake_case enums, stderr default) and adds the OCSF
-// and attestation settings.
-
 //! Operator configuration: exporters, product identity, chaining and
 //! signing.
 
@@ -16,18 +12,23 @@ use serde_json::Value;
 
 use crate::emitter::TracingExporter;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+const MISSING_OUTPUT: &str = "no audit destination configured; set `destination: stderr` or \
+                              `destination: tracing`, or list `exporters` (kinds: stderr, \
+                              stdout, file, tracing)";
+
 /// The `config:` block of an `audit/ocsf` plugin entry.
 ///
-/// `Default` is written out below rather than derived, so that the defaults
-/// an entry gets by omitting the whole `config:` block are the ones
-/// documented on the fields.
+/// `destination` or `exporters` must be set before the sink can load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcsfAuditConfig {
     /// Where OCSF events go, as a single destination: `stderr` or
     /// `tracing`. Mutually exclusive with `exporters`, which can name
-    /// several. With neither set, records go to stderr, which keeps the
-    /// demo flow (`docker compose logs -f | jq`) identical to audit-logger.
+    /// several. One of the two is required.
     #[serde(default)]
     pub destination: Option<OcsfDestination>,
 
@@ -69,7 +70,7 @@ pub struct OcsfAuditConfig {
     /// `<chain_uid>-<seq>`, so the uids are unique only within that
     /// process. Two processes sharing a configured `chain_uid`, a restart
     /// or a replica, mint colliding uids, and a consumer deduplicating by
-    /// `metadata.uid` (AID-EMIT-1 section 6) discards the later records as
+    /// `metadata.uid` discards the later records as
     /// replays. Give every process its own value, or leave it unset and
     /// take the per-process default.
     #[serde(default)]
@@ -109,8 +110,7 @@ pub struct OcsfAuditConfig {
     /// so a verifier can resolve the public key from the authority's
     /// published key set. Rides in `unmapped`, outside the hashed bytes
     /// like the signature itself, because `digital_signature` has no
-    /// member for signature material; that gap is filed as
-    /// ocsf-schema#1709.
+    /// member for signature material.
     #[serde(default)]
     pub signing_key_id: Option<String>,
 
@@ -135,12 +135,6 @@ pub struct OcsfAuditConfig {
 }
 
 impl Default for OcsfAuditConfig {
-    /// The same values the `#[serde(default ...)]` attributes above supply,
-    /// through the same functions. A derived `Default` would give `chain`
-    /// and `include_gap_fields` as `false`, which is not what the fields
-    /// say and not what an entry with a `config: {}` block gets: a sink
-    /// running on its defaults would emit records with no attestation, no
-    /// fingerprint and no signature, and nothing would say so.
     fn default() -> Self {
         Self {
             destination: None,
@@ -169,8 +163,8 @@ fn default_true() -> bool {
     true
 }
 
-/// Where a record is written.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Where a record is written when `destination` is set.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OcsfDestination {
     /// One OCSF JSON object per line to stderr.
@@ -236,26 +230,14 @@ impl OcsfExporterConfig {
 
 impl OcsfAuditConfig {
     /// The exporters records go to: `exporters` when set, otherwise the one
-    /// `destination` names, otherwise stderr.
+    /// `destination` names.
     ///
     /// # Errors
     ///
-    /// `destination` and `exporters` both set, an empty `exporters` list, or
-    /// an exporter that cannot be opened.
+    /// Returns an error if neither output is set, both are set, the exporter
+    /// list is empty, or an exporter cannot be opened.
     pub fn build_exporters(&self) -> Result<Vec<Arc<dyn AuditExporter>>, ExportError> {
-        match (&self.destination, &self.exporters) {
-            (Some(_), Some(_)) => Err(ExportError::Config(
-                "set either `destination` or `exporters`, not both".to_owned(),
-            )),
-            (_, Some(list)) if list.is_empty() => Err(ExportError::Config(
-                "`exporters` is empty; name at least one, or omit it for stderr".to_owned(),
-            )),
-            (_, Some(list)) => list.iter().map(OcsfExporterConfig::build).collect(),
-            (Some(OcsfDestination::Tracing), None) => Ok(vec![Arc::new(TracingExporter)]),
-            (Some(OcsfDestination::Stderr) | None, None) => {
-                Ok(vec![ExporterConfig::Stderr.build()?])
-            },
-        }
+        OutputSelection::try_from(self)?.build_exporters()
     }
 }
 
@@ -271,4 +253,48 @@ pub enum SigningMode {
     /// ECDSA-P256-SHA256 over the PAE of the event's canonical bytes; see
     /// `sign.rs`. Requires a key.
     Dsse,
+}
+
+enum OutputSelection<'a> {
+    Destination(OcsfDestination),
+    Exporters {
+        first: &'a OcsfExporterConfig,
+        rest: &'a [OcsfExporterConfig],
+    },
+}
+
+impl<'a> TryFrom<&'a OcsfAuditConfig> for OutputSelection<'a> {
+    type Error = ExportError;
+
+    fn try_from(config: &'a OcsfAuditConfig) -> Result<Self, Self::Error> {
+        match (&config.destination, &config.exporters) {
+            (None, None) => Err(ExportError::Config(MISSING_OUTPUT.to_owned())),
+            (Some(_), Some(_)) => Err(ExportError::Config(
+                "set either `destination` or `exporters`, not both".to_owned(),
+            )),
+            (None, Some(list)) => {
+                let Some((first, rest)) = list.split_first() else {
+                    return Err(ExportError::Config(
+                        "`exporters` is empty; name at least one of stderr, stdout, file or tracing"
+                            .to_owned(),
+                    ));
+                };
+                Ok(Self::Exporters { first, rest })
+            },
+            (Some(destination), None) => Ok(Self::Destination(*destination)),
+        }
+    }
+}
+
+impl OutputSelection<'_> {
+    fn build_exporters(self) -> Result<Vec<Arc<dyn AuditExporter>>, ExportError> {
+        match self {
+            Self::Destination(OcsfDestination::Tracing) => Ok(vec![Arc::new(TracingExporter)]),
+            Self::Destination(OcsfDestination::Stderr) => Ok(vec![ExporterConfig::Stderr.build()?]),
+            Self::Exporters { first, rest } => std::iter::once(first)
+                .chain(rest.iter())
+                .map(OcsfExporterConfig::build)
+                .collect(),
+        }
+    }
 }

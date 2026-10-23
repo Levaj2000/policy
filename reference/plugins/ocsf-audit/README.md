@@ -82,9 +82,9 @@ plugins:
       - read_labels
       - read_workload
     config:
-      exporters:                 # every record goes to each, byte for byte
+      exporters:                 # required (or `destination: stderr|tracing`);
         - { kind: file, path: /var/log/praxis/ocsf.ndjson, fsync: batch }
-        - { kind: stderr }
+        - { kind: stderr }       # every record goes to each, byte for byte
       chain: true                # fingerprint chain, record_integrity profile
       signing: dsse              # or: none (chained but unsigned)
       signing_key_pem_path: /etc/praxis/ocsf-signing.pem   # PKCS#8 P-256
@@ -172,8 +172,8 @@ after an open or rotation, so the pathname is durable along with the records.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `exporters` | unset | Where records go, as a list. Each record is serialized once and written unchanged to every exporter, so the copies are byte-identical and share a `metadata.uid`. Kinds: `stderr` and `stdout` (one record per line), `file` (`path`, absolute; appended one record per line, created owner-only, never truncated; `fsync`: `never`, `batch` or `always`, default `never`; follows rename-based rotation on Unix by reopening the path, so use logrotate's `create` mode with `delaycompress` rather than `copytruncate`, which drops records written during the copy), and `tracing` (one event per record at target `ocsf.audit`). An exporter that fails is logged and the rest still run. An unwritable file fails startup. |
-| `destination` | `stderr` | A single destination, `stderr` or `tracing`, the same as one entry in `exporters`. Set `destination` or `exporters`, not both. With neither, records go to stderr. |
+| `exporters` | required, or `destination` | Where records go, as a list. Each record is serialized once and written unchanged to every exporter, so the copies are byte-identical and share a `metadata.uid`. Kinds: `stderr` and `stdout` (one record per line), `file` (`path`, absolute; appended one record per line, created owner-only, never truncated; `fsync`: `never`, `batch` or `always`, default `never`; follows rename-based rotation on Unix by reopening the path, so use logrotate's `create` mode with `delaycompress` rather than `copytruncate`, which drops records written during the copy), and `tracing` (one event per record at target `ocsf.audit`). An exporter that fails is logged and the rest still run. An unwritable file fails startup. |
+| `destination` | required, or `exporters` | A single destination, `stderr` or `tracing`, the same as one entry in `exporters`. Set `destination` or `exporters`, not both. With neither, the sink refuses to load and the error lists the options: an entry that names no output is never mistaken for a working one. |
 | `product_name`, `vendor_name` | Praxis Policy Engine OCSF Audit / Praxis | `metadata.product`. |
 | `chain` | `true` | Attach the attestation and declare `record_integrity`. |
 | `chain_uid` | plugin name plus a random per-process suffix | `attestation.chain_uid`. One chain per process; a configured value must be unique per process (see [Chain scope](#chain-scope)). |

@@ -66,6 +66,7 @@ fn emitter() -> OcsfAuditEmitter {
         priority: 50,
         on_error: OnError::Fail,
         config: Some(json!({
+            "destination": "stderr",
             "chain": true,
             "signing": "dsse",
             "signing_key_pem": demo_key_pem(),

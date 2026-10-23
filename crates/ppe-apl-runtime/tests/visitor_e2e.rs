@@ -1296,8 +1296,6 @@ async fn llm_input_allowed(mgr: &PolicyEngine, ext: Extensions) -> bool {
     result.continue_processing
 }
 
-/// The tool-definition policy from the issue: offering `send_email` to the
-/// model is denied unless the caller is in finance.
 #[tokio::test]
 async fn llm_route_denies_on_an_offered_tool() {
     let mgr = build_manager_with_visitor(LLM_REQUEST_YAML).await;

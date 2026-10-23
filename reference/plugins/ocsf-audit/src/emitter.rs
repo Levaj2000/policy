@@ -125,13 +125,12 @@ impl std::fmt::Debug for OcsfAuditEmitter {
 }
 
 impl OcsfAuditEmitter {
-    /// Parse the plugin's `config:` block and build the signer.
+    /// Build an audit sink from a plugin entry.
     ///
     /// # Errors
     ///
-    /// A config that does not parse, or `signing: dsse` with no key, both
-    /// keys, or a key that cannot be read or parsed. A missing key fails
-    /// here rather than falling back to unsigned records.
+    /// Returns an error for invalid configuration, a missing output, an
+    /// unavailable exporter, or invalid signing keys.
     pub fn new(mut cfg: PluginConfig) -> Result<Self, Box<PluginError>> {
         let mut typed: OcsfAuditConfig = match cfg.config.as_ref() {
             Some(raw) => serde_json::from_value(raw.clone()).map_err(|e| {
@@ -142,9 +141,6 @@ impl OcsfAuditEmitter {
                     ),
                 })
             })?,
-            // No `config:` block at all. `OcsfAuditConfig`'s hand-written
-            // `Default` carries the documented field defaults, chaining
-            // included, so this path and a `config: {}` block agree.
             None => OcsfAuditConfig::default(),
         };
 
@@ -658,7 +654,13 @@ mod tests {
     use praxis_policy_core::plugin::{OnError, PluginMode};
     use std::collections::HashMap;
 
-    fn cfg(extra: serde_json::Value) -> PluginConfig {
+    fn cfg(mut extra: serde_json::Value) -> PluginConfig {
+        if let Some(block) = extra.as_object_mut()
+            && !block.contains_key("destination")
+            && !block.contains_key("exporters")
+        {
+            block.insert("destination".into(), json!("stderr"));
+        }
         PluginConfig {
             name: "ocsf-audit".into(),
             kind: super::super::factory::KIND.into(),
@@ -1021,15 +1023,9 @@ mod tests {
         assert!(ev["unmapped"]["signature_b64"].is_string());
     }
 
-    /// A `plugins:` entry can omit `config:` entirely, which is the shape
-    /// every defaulted field invites. The sink must still chain there: an
-    /// unattested record carries no fingerprint and no signature, and
-    /// nothing in it says the integrity seam was off.
     #[test]
-    fn no_config_block_takes_the_documented_defaults() {
-        let mut c = cfg(json!({}));
-        c.config = None;
-        let e = OcsfAuditEmitter::new(c).unwrap();
+    fn a_destination_only_config_block_takes_the_documented_defaults() {
+        let e = OcsfAuditEmitter::new(cfg(json!({ "destination": "stderr" }))).unwrap();
         assert!(e.typed.chain, "chain defaults on");
         assert!(e.typed.include_gap_fields, "gap fields default on");
         assert_eq!(e.typed.product_name, "Praxis Policy Engine OCSF Audit");
@@ -2020,11 +2016,56 @@ mod tests {
     }
 
     #[test]
-    fn with_no_destination_or_exporters_records_go_to_stderr() {
-        assert_eq!(exporter_names(&OcsfAuditConfig::default()), ["stderr"]);
-        let typed: OcsfAuditConfig =
+    fn with_no_destination_or_exporters_the_sink_refuses_to_load() {
+        let err = OcsfAuditConfig::default().build_exporters().unwrap_err();
+        let msg = err.to_string();
+        for needle in [
+            "destination",
+            "exporters",
+            "stderr",
+            "tracing",
+            "stdout",
+            "file",
+        ] {
+            assert!(msg.contains(needle), "the error must name {needle}: {msg}");
+        }
+
+        let mut absent = cfg(json!({}));
+        absent.config = None;
+        let mut silent = cfg(json!({}));
+        silent.config = Some(json!({ "chain": true }));
+        for c in [absent, silent] {
+            let err = OcsfAuditEmitter::new(c).unwrap_err().to_string();
+            assert!(
+                err.contains("no audit destination configured"),
+                "an entry without an output must not build: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_destination_is_the_one_exporter() {
+        let stderr: OcsfAuditConfig =
+            serde_json::from_value(json!({ "destination": "stderr" })).unwrap();
+        assert_eq!(
+            exporter_names(&stderr),
+            ["stderr"],
+            "destination: stderr must build one stderr exporter"
+        );
+        let tracing: OcsfAuditConfig =
             serde_json::from_value(json!({ "destination": "tracing" })).unwrap();
-        assert_eq!(exporter_names(&typed), ["tracing"]);
+        assert_eq!(
+            exporter_names(&tracing),
+            ["tracing"],
+            "destination: tracing must build one tracing exporter"
+        );
+    }
+
+    #[test]
+    fn an_unknown_destination_is_rejected() {
+        let err = exporter_err(json!({ "destination": "carrier-pigeon" }));
+        assert!(err.contains("parse failed"), "{err}");
+        assert!(err.contains("carrier-pigeon"), "{err}");
     }
 
     /// Signed, chained records from the decision sink, fanned out to two
@@ -2042,6 +2083,7 @@ mod tests {
         let a = dir.0.join("a.ndjson");
         let b = dir.0.join("b.ndjson");
         let mut extra = signed_cfg().config.unwrap();
+        extra.as_object_mut().unwrap().remove("destination");
         extra["exporters"] = json!([
             { "kind": "file", "path": a, "fsync": "batch" },
             { "kind": "file", "path": b },

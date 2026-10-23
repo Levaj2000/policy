@@ -7396,10 +7396,6 @@ routes:
         assert!(err.contains("hr-*"), "{err}");
     }
 
-    /// Two globs with different patterns that match overlapping names are NOT
-    /// duplicates. Each contributes its own pattern as the annotation key, so
-    /// `"hr-*"` and `"*"` install under different keys and `resolve_route`
-    /// picks the winner by specificity at dispatch time (issue #74).
     #[test]
     fn overlapping_globs_with_different_patterns_load() {
         let cfg = routes_load(
@@ -9134,8 +9130,6 @@ routes:
         assert_eq!(header_names(&resource), vec!["x-global", "x-shared"]);
     }
 
-    /// #42 made a per-path contract expressible. The route's content stacks on
-    /// the generic-HTTP entity default and on global.
     #[test]
     fn an_http_route_stacks_on_the_levels_above_it() {
         let config = load(

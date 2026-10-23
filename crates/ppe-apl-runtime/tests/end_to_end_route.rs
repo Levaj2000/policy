@@ -823,10 +823,6 @@ async fn tagger_manager_with_store_and_yaml(
     mgr
 }
 
-/// A `session.load_failed` denial still carries the route's custom
-/// `response:` (denyWith) on its `details` map — the fix that closed prior
-/// review gap #3 must hold for the load-failure fail-closed path, not just
-/// `Decision::Deny`.
 #[tokio::test]
 async fn load_failure_carries_route_response() {
     let store: Arc<dyn SessionStore> = Arc::new(ErrorSessionStore {

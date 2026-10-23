@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Throughput under concurrency (issue #19 — Throughput).
+//! Throughput under concurrency.
 //!
 //! Decisions/sec with many Tokio tasks calling `invoke_named`, including
 //! YAML `mode: concurrent`.
