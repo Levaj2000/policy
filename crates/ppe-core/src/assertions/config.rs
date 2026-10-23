@@ -604,8 +604,8 @@ mod tests {
     use super::*;
     use crate::config::{PolicyConfig, parse_config};
 
-    /// The worked example from the plan, tracked as a fixture so a breaking
-    /// config change shows up as a failing load rather than as stale prose.
+    // A config change must fail this fixture's load test instead of leaving
+    // the documented example stale.
     const WORKED_EXAMPLE: &str =
         include_str!("../../tests/fixtures/assertions_worked_example.yaml");
 

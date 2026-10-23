@@ -572,6 +572,11 @@ Rustdoc quality is enforced at compile time via
   correctly. If a sentence describes how the function
   works rather than what it does or when to call it,
   remove it.
+- Do not put plan, issue, or PR provenance IDs or links in
+  rustdoc (`///` and `//!`). Describe the current contract
+  or rationale instead. Keep tracking references in PR
+  descriptions or changelogs. Protocol RFC citations remain
+  required under [RFC Conformance](#rfc-conformance).
 - Do not over-explain standard patterns (Arc, Cow, early
   returns, option unwrapping) in prose.
 - Do not add redundant "Default: X" lines when the

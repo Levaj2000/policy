@@ -34,7 +34,7 @@ use praxis_policy_builtins::pdps::cel::CelResolver;
 use praxis_policy_core::engine::PolicyEngine;
 use tokio::runtime::Runtime;
 
-/// Fail loud in setup if a fixture times a deny path (same idea as PR 35).
+// A deny fixture would measure a different execution path.
 fn assert_allow(label: &str, d: &PdpDecision) {
     assert!(
         matches!(d.decision, Decision::Allow),
