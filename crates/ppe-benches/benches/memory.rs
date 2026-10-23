@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Memory / session-taint growth (issue #19 — Memory).
+//! Memory and session taint growth.
 //!
 //! 1. **`SessionStore` curve** — `append_labels` / `load_labels` as label
 //!    set and session count grow (session taint sticks across requests).

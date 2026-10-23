@@ -20,10 +20,10 @@ pub(crate) struct AllowlistEntry {
     pub(crate) apl_allows: Option<bool>,
 }
 
-/// Seed entries from issue #25 (floats, missing collections) plus a
-/// missing principal, then the structured-input splits Cedar's value
-/// model forces. Present-empty `StringSet` and omitted claim scalars are
-/// not splits: they live in the subset as `AgreeDeny`.
+/// Seed entries for floats, missing collections and a missing principal,
+/// then the structured-input splits Cedar's value model forces.
+/// Present-empty `StringSet` and omitted claim scalars are not splits: they
+/// live in the subset as `AgreeDeny`.
 pub(crate) fn allowlist() -> Vec<AllowlistEntry> {
     vec![
         AllowlistEntry {

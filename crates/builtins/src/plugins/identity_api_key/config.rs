@@ -58,8 +58,7 @@ pub enum ExpiryPolicy {
 pub struct ApiKeyResolverConfig {
     /// Where the credential sits on the request.
     ///
-    /// Exactly PR #96's `Credential` shape, so adopting the shared type when it
-    /// merges changes no operator's YAML.
+    /// Uses the shared `Credential` shape.
     pub credential: Credential,
 
     /// What a value at that location must start with to be one this resolver

@@ -231,7 +231,7 @@ impl Extensions {
 
     /// Install one source result under its trusted plugin registration.
     ///
-    /// Callers are the metadata PIP fetch step (#184), which installs each
+    /// Callers are the metadata PIP fetch step, which installs each
     /// source result before the evaluator advances, and hosts that resolve
     /// facts themselves before dispatch. Ordinary plugins receive an
     /// immutable filtered view and have no metadata write capability.

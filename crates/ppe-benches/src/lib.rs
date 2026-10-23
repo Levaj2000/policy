@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Shared fixtures for the Criterion suite (issue #19).
+//! Shared fixtures for the Criterion suite.
 //!
 //! Setup (YAML load, Cedar compile, plugin factory registration) runs
 //! **outside** Criterion iters. Timed loops only call the hot path:
