@@ -237,19 +237,7 @@ impl OcsfAuditConfig {
     /// Returns an error if neither output is set, both are set, the exporter
     /// list is empty, or an exporter cannot be opened.
     pub fn build_exporters(&self) -> Result<Vec<Arc<dyn AuditExporter>>, ExportError> {
-        match (&self.destination, &self.exporters) {
-            (None, None) => Err(ExportError::Config(MISSING_OUTPUT.to_owned())),
-            (Some(_), Some(_)) => Err(ExportError::Config(
-                "set either `destination` or `exporters`, not both".to_owned(),
-            )),
-            (_, Some(list)) if list.is_empty() => Err(ExportError::Config(
-                "`exporters` is empty; name at least one of stderr, stdout, file or tracing"
-                    .to_owned(),
-            )),
-            (_, Some(list)) => list.iter().map(OcsfExporterConfig::build).collect(),
-            (Some(OcsfDestination::Tracing), None) => Ok(vec![Arc::new(TracingExporter)]),
-            (Some(OcsfDestination::Stderr), None) => Ok(vec![ExporterConfig::Stderr.build()?]),
-        }
+        OutputSelection::try_from(self)?.build_exporters()
     }
 }
 
@@ -265,4 +253,48 @@ pub enum SigningMode {
     /// ECDSA-P256-SHA256 over the PAE of the event's canonical bytes; see
     /// `sign.rs`. Requires a key.
     Dsse,
+}
+
+enum OutputSelection<'a> {
+    Destination(OcsfDestination),
+    Exporters {
+        first: &'a OcsfExporterConfig,
+        rest: &'a [OcsfExporterConfig],
+    },
+}
+
+impl<'a> TryFrom<&'a OcsfAuditConfig> for OutputSelection<'a> {
+    type Error = ExportError;
+
+    fn try_from(config: &'a OcsfAuditConfig) -> Result<Self, Self::Error> {
+        match (&config.destination, &config.exporters) {
+            (None, None) => Err(ExportError::Config(MISSING_OUTPUT.to_owned())),
+            (Some(_), Some(_)) => Err(ExportError::Config(
+                "set either `destination` or `exporters`, not both".to_owned(),
+            )),
+            (None, Some(list)) => {
+                let Some((first, rest)) = list.split_first() else {
+                    return Err(ExportError::Config(
+                        "`exporters` is empty; name at least one of stderr, stdout, file or tracing"
+                            .to_owned(),
+                    ));
+                };
+                Ok(Self::Exporters { first, rest })
+            },
+            (Some(destination), None) => Ok(Self::Destination(*destination)),
+        }
+    }
+}
+
+impl OutputSelection<'_> {
+    fn build_exporters(self) -> Result<Vec<Arc<dyn AuditExporter>>, ExportError> {
+        match self {
+            Self::Destination(OcsfDestination::Tracing) => Ok(vec![Arc::new(TracingExporter)]),
+            Self::Destination(OcsfDestination::Stderr) => Ok(vec![ExporterConfig::Stderr.build()?]),
+            Self::Exporters { first, rest } => std::iter::once(first)
+                .chain(rest.iter())
+                .map(OcsfExporterConfig::build)
+                .collect(),
+        }
+    }
 }
