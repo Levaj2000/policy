@@ -16,6 +16,16 @@ use serde_json::Value;
 
 use crate::emitter::TracingExporter;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// The error for an entry that names no output at all. Lists every option
+/// so the operator can finish the entry from the message alone.
+const MISSING_OUTPUT: &str = "no audit destination configured; set `destination: stderr` or \
+                              `destination: tracing`, or list `exporters` (kinds: stderr, \
+                              stdout, file, tracing)";
+
 /// The `config:` block of an `audit/ocsf` plugin entry.
 ///
 /// `Default` is written out below rather than derived, so that the defaults
@@ -267,12 +277,6 @@ impl OcsfAuditConfig {
         }
     }
 }
-
-/// The error for an entry that names no output at all. Lists every option
-/// so the operator can finish the entry from the message alone.
-const MISSING_OUTPUT: &str = "no audit destination configured; set `destination: stderr` or \
-                              `destination: tracing`, or list `exporters` (kinds: stderr, \
-                              stdout, file, tracing)";
 
 /// How the attestation is signed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
