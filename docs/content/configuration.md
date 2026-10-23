@@ -161,6 +161,8 @@ plugins:
   - name: audit-log
     kind: audit/logger
     hooks: [cmf.tool_pre_invoke]
+    config:
+      destination: stderr
 
 routes:
   - tool: get_compensation

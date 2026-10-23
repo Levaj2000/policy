@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Hook / plugin-dispatch overhead (issue #19 — Time: plugin dispatch).
+//! Hook and plugin dispatch overhead.
 //!
 //! Isolates the executor path with **no APL visitor and no PDP**:
 //! `register_handler_for_names` → `invoke_named` → N no-op `HookHandler`s.

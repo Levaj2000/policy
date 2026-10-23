@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Full-decision latency (issue #19 — Time: full decision + eval vs dispatch).
+//! Full decision latency.
 //!
 //! | Fixture              | Path                                      |
 //! |----------------------|-------------------------------------------|

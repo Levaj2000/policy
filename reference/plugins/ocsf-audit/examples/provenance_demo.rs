@@ -85,6 +85,7 @@ fn sink() -> OcsfAuditEmitter {
         priority: 50,
         on_error: OnError::Fail,
         config: Some(json!({
+            "destination": "stderr",
             "chain": false,
             "product_name": "AI Identity OCSF Audit",
             "vendor_name": "AI Identity",

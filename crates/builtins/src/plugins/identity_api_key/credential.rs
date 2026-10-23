@@ -32,8 +32,8 @@ use crate::plugins::identity_api_key::directory::PresentedKey;
 
 /// Where the credential sits on the request.
 ///
-/// `#[non_exhaustive]` for the same reason #96 gives: a location added later
-/// must not break an exhaustive `match` downstream.
+/// `#[non_exhaustive]` lets new locations be added without breaking
+/// downstream matches.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -56,7 +56,7 @@ impl std::fmt::Display for Credential {
 /// Where the credential sits, and what marks it as this resolver's.
 ///
 /// Built from two sibling config keys rather than deserialized as one block.
-/// `credential:` is then exactly #96's `Credential` with nothing wrapped around
+/// `credential:` is a `Credential` with nothing wrapped around
 /// it, and `prefix:` sits beside it, which is also where it belongs: a prefix
 /// says which key population a credential is from, not where it was found.
 ///
@@ -96,7 +96,7 @@ pub struct CredentialLocation {
 
 /// What reading the configured location produced.
 ///
-/// The deny codes follow #96's names for the extraction phase, so two identity
+/// The deny codes share names for the extraction phase, so two identity
 /// plugins report the same condition the same way and an operator's runbook
 /// holds for both.
 #[derive(Debug, PartialEq, Eq)]

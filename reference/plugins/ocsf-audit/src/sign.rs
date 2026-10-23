@@ -243,11 +243,10 @@ pub fn fingerprint_value(canonical_bytes: &[u8]) -> String {
 /// 1. remove `attestation_list[0].fingerprint` and `.signatures` (the
 ///    schema's own exclusions);
 /// 2. remove `unmapped.signature_b64` / `unmapped.signature_key_id`: the
-///    signature bytes have no `digital_signature` home until
-///    ocsf-schema#1709 lands, so they ride in `unmapped`, and being
-///    derived from the hash they cannot be inside it (dropping `unmapped`
-///    entirely if that leaves it empty, since an empty object was never
-///    emitted pre-signing);
+///    signature bytes have no `digital_signature` home, so they ride in
+///    `unmapped`. Being derived from the hash, they cannot be hashed
+///    themselves. Drop `unmapped` entirely if this leaves it empty, since
+///    an empty object was never emitted before signing;
 /// 3. canonicalize (JCS).
 ///
 /// Then `fingerprint_value(bytes)` must equal the attestation's
@@ -300,8 +299,8 @@ pub fn dsse_pae(payload: &[u8]) -> Vec<u8> {
 /// Result of signing: the detached signature bytes (base64 DER) and the
 /// OCSF `digital_signature` descriptor to embed in
 /// `attestation.signatures`. `key_id` (the JWKS `kid`) rides beside the
-/// bytes at `unmapped.signature_key_id` until ocsf-schema#1709 gives both
-/// a schema home.
+/// bytes at `unmapped.signature_key_id` because the schema has no field
+/// for them.
 pub struct Signed {
     /// The DER signature, base64 (standard alphabet, padded).
     pub signature: String,

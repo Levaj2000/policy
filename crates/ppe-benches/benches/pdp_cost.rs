@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Per-PDP evaluation cost (issue #19 — Cedar / CEL / OPA separately).
+//! Per-PDP evaluation cost for Cedar, CEL and OPA.
 //!
 //! Compiles / loads each resolver **once** in setup. Timed loop is only
 //! `PdpResolver::evaluate`. All three fixtures enforce the same rule:

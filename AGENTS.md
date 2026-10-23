@@ -97,9 +97,10 @@ ppe (facade)
 
 ## Conventions
 
-Read and follow the [development conventions](docs/dev/conventions.md).
-The repository-specific decisions below take precedence over the shared
-style recommendations.
+Before reviewing or changing code, open and read the
+[development conventions](docs/dev/conventions.md) in this working session,
+then follow them. The repository-specific decisions below take precedence
+over the shared style recommendations.
 
 ### Deliberate divergences from conventions template
 

@@ -1051,3 +1051,66 @@ async fn leak_checks_include_tokens_minted_before_a_denial() {
     out.assert_no_leaks(&Planted::new());
     assert_recorded_token(&mut out, minted, "access_token");
 }
+
+/// Load a document with one CIBA plugin whose `store` is omitted for `None`.
+fn load_ciba_store(store: Option<&str>, global: &str) -> Result<(), String> {
+    let engine = Arc::new(PolicyEngine::default());
+    praxis_policy::install_builtins(&engine);
+    let store = store.map_or(String::new(), |s| format!("      store: {s}\n"));
+    engine
+        .load_config_yaml(&format!(
+            "
+plugins:
+  - name: manager-approver
+    kind: elicitation/ciba
+    hooks: [elicit]
+    capabilities: [perform_http]
+    config:
+      backchannel_endpoint: https://idp.example/ciba/auth
+      token_endpoint: https://idp.example/token
+      client_id: praxis-policy-gateway
+      client_secret_source: {{ kind: literal, secret: shh }}
+{store}routes:
+  - tool: approve_raise
+    authorization:
+      pre_invocation:
+        - 'require_approval(manager-approver, from: claim.manager, purpose: \"Approve\")'
+{global}"
+        ))
+        .map_err(|e| e.to_string())
+}
+
+const VALKEY_GLOBAL: &str =
+    "global:\n  session_store:\n    kind: valkey\n    endpoint: localhost:6379\n";
+
+#[test]
+fn an_omitted_ciba_store_fails_even_with_a_valkey_session_store() {
+    for global in ["", VALKEY_GLOBAL] {
+        let err = load_ciba_store(None, global).expect_err("store choice is required");
+        assert!(err.contains("store"), "global={global:?}: {err}");
+    }
+}
+
+#[test]
+fn an_explicit_memory_store_loads() {
+    load_ciba_store(Some("{ kind: memory }"), "").expect("load");
+}
+
+#[test]
+fn a_ciba_store_can_reference_the_valkey_session_store() {
+    load_ciba_store(
+        Some("{ kind: valkey, connection: session_store, key_prefix: ciba:v1, password: ciba-secret }"),
+        VALKEY_GLOBAL,
+    )
+    .expect("the reference resolves against global.session_store");
+}
+
+#[test]
+fn a_ciba_store_reference_without_a_valkey_session_store_fails_to_load() {
+    let err = load_ciba_store(Some("{ kind: valkey, connection: session_store }"), "")
+        .expect_err("nothing to reference");
+    assert!(
+        err.contains("manager-approver") && err.contains("global.session_store"),
+        "{err}"
+    );
+}

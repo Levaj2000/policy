@@ -203,6 +203,7 @@ impl PluginFactory for PanickingFactory {
 /// is exactly what the README shows an operator writing.
 fn sink_config() -> serde_json::Value {
     let mut cfg = json!({
+        "destination": "stderr",
         "chain": false,
         "product_name": "AI Identity OCSF Audit",
         "vendor_name": "AI Identity",

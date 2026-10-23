@@ -80,6 +80,7 @@ fn env_str(key: &str, default: &str) -> String {
 
 fn sink() -> OcsfAuditEmitter {
     let mut cfg = json!({
+        "destination": "stderr",
         "chain": false,
         "product_name": "AI Identity OCSF Audit",
         "vendor_name": "AI Identity",

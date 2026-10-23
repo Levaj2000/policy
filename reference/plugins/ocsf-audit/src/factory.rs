@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn a_config_the_emitter_refuses_fails_the_factory() {
         let mut config = cfg(vec![]);
-        config.config = Some(serde_json::json!({ "signing": "dsse" }));
+        config.config = Some(serde_json::json!({ "destination": "stderr", "signing": "dsse" }));
         let Err(err) = OcsfAuditFactory.create(&config) else {
             panic!("signing=dsse with no key must not build");
         };
@@ -232,6 +232,7 @@ mod tests {
         for signing in ["none", "dsse"] {
             let mut config = cfg(vec![]);
             config.config = Some(serde_json::json!({
+                "destination": "stderr",
                 "signing": signing,
                 "signing_key_pem": "private-key-marker",
             }));

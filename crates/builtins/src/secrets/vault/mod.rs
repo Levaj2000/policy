@@ -12,7 +12,7 @@
 //!
 //! There is no spawned ticker. A task binds to whichever runtime called
 //! `initialize()`, and a host that initializes on a short-lived runtime
-//! has it cancelled before it ticks once — issue #29, which is why
+//! has it cancelled before it ticks once, which is why
 //! `identity-jwt` refreshes from the verify path rather than a background
 //! loop. Token renewal has no request path to hang off after startup:
 //! nothing calls Vault until the next `refresh_secrets()`. So renewal is

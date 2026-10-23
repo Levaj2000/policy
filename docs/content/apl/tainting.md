@@ -71,6 +71,14 @@ global:
     endpoint: localhost:6379
 ```
 
+`password` accepts a string, `{ env: NAME }`, or `{ file: PATH }`. File
+contents are trimmed to support mounted secrets. An unset variable or
+unreadable file fails at load.
+
+This store does not hold CIBA approvals. Those have their own `store:` block,
+which may reuse this connection; see
+[Elicitation](elicitation.md#correlation-store).
+
 Labels are scoped per subject. Two callers sharing a session identifier do not
 share taint: a label set while acting as one subject does not leak into another
 subject's decisions. With the Valkey store, labels survive a gateway restart, so

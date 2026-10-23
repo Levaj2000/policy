@@ -89,7 +89,7 @@ pub use praxis_policy_core::engine::PolicyEngine;
 /// Surfaced here so a host embedding the engine can name them without reaching
 /// through to `praxis_policy_core`. Plugin *authors* get the same two names from
 /// [`prelude`].
-pub use praxis_policy_core::factory::{PluginFactory, PluginInstance};
+pub use praxis_policy_core::factory::{FactoryContext, PluginFactory, PluginInstance};
 
 /// What a host needs to give the engine its secrets.
 ///
@@ -145,7 +145,9 @@ pub use praxis_policy_builtins::plugins::identity_api_key::{
     ApiKeyIdentityFactory, KIND as API_KEY_KIND,
 };
 #[cfg(feature = "jwt")]
-pub use praxis_policy_builtins::plugins::identity_jwt::{JwtIdentityFactory, KIND as JWT_KIND};
+pub use praxis_policy_builtins::plugins::identity_jwt::{
+    JwtIdentityFactory, JwtIdentityFactoryWithReplay, KIND as JWT_KIND,
+};
 #[cfg(feature = "experimental-quota")]
 pub use praxis_policy_builtins::plugins::quota::{KIND as QUOTA_KIND, QuotaFactory};
 #[cfg(feature = "secrets-vault")]
@@ -155,7 +157,8 @@ pub use praxis_policy_builtins::secrets::vault::{
 };
 #[cfg(feature = "valkey")]
 pub use praxis_policy_builtins::session::valkey::{
-    KIND as VALKEY_KIND, ValkeyConfig, ValkeySessionStoreFactory,
+    KIND as VALKEY_KIND, PasswordSource as ValkeyPasswordSource, ValkeyConfig,
+    ValkeySessionStoreFactory,
 };
 
 // =============================================================================

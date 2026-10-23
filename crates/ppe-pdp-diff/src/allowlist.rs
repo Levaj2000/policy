@@ -20,10 +20,9 @@ pub(crate) struct AllowlistEntry {
     pub(crate) apl_allows: Option<bool>,
 }
 
-/// Seed entries from issue #25 (floats, missing collections) plus a
-/// missing principal, then the structured-input splits Cedar's value
-/// model forces. Present-empty `StringSet` and omitted claim scalars are
-/// not splits: they live in the subset as `AgreeDeny`.
+/// Records differences the shared corpus cannot require every dialect to
+/// agree on. These include Cedar's value-model limits and APL's `!=` on a
+/// missing claim. Cases with identical outcomes stay in the shared corpus.
 pub(crate) fn allowlist() -> Vec<AllowlistEntry> {
     vec![
         AllowlistEntry {

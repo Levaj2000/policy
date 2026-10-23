@@ -33,10 +33,9 @@ use crate::plugins::identity_api_key::http_directory::HttpDirectory;
 ///
 /// Two phases, named differently on purpose.
 ///
-/// **Extraction** codes are shared with the JWT resolver, spelled as PR #96
-/// spells them. Reading a credential off the wire fails the same way whatever
-/// the credential turns out to be, so an operator's runbook for
-/// `auth.missing_credential` has to hold across plugins.
+/// **Extraction** codes are shared with the JWT resolver. Reading a credential
+/// off the wire fails consistently across both plugins, so an operator's
+/// runbook for `auth.missing_credential` applies to both.
 ///
 /// **Lookup** codes are this plugin's own, because nothing else has them. In
 /// particular `KEY_UNKNOWN` and `DIRECTORY_UNAVAILABLE` stay apart: both deny,

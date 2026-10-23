@@ -85,6 +85,20 @@ real server, because a session store is not meaningfully covered by a
 fake. That component makes Session Taint survive a reload or
 span a replica, so it is worth running them for real.
 
+The CIBA script-cache reload test flushes the server's entire script cache.
+It starts a separate Valkey container, or uses `VALKEY_SCRIPT_TEST_URL` when
+that is set to a dedicated server. Do not point it at `VALKEY_TEST_URL`.
+
+The shared `DPoP` replay guard has an ignored Valkey test under the `jwt`
+and `valkey` features. It uses two independent connection pools to the same
+server and checks that the second gateway rejects a replay. Set
+`VALKEY_TEST_URL` or let testcontainers start Valkey, then run:
+
+```console
+cargo test -p praxis-policy-builtins --features jwt,valkey \
+  --test jwt valkey_rejects_a_replay_across_independent_gateway_pools -- --ignored
+```
+
 ### Vault KV v2 live test
 
 The Vault provider's normal suite uses `FakeTransport` for deterministic
@@ -127,6 +141,36 @@ docker stop ppe-vault
 The test fails if the ordinary read is not `live-value`, or if the
 soft-deleted response is not HTTP 404 with `data.data: null`, a deletion
 timestamp, and a `SecretError::NotFound` mapping.
+
+### `DPoP` live test
+
+The `DPoP` suite in `crates/builtins/tests/jwt` signs its proofs with the same
+library the verifier uses, so a mistake shared by both sides would pass. The
+live check takes the token and its `cnf.jkt` from Keycloak instead: Keycloak
+verifies the proof sent to its token endpoint and binds the token to the key
+itself. The test then presents that token, with a fresh proof, to the
+`identity/jwt` resolver, and checks a replay, the `Bearer` scheme, and another
+key's proof are refused. It needs the `jwt` and `http-hyper` features and is
+`#[ignore]`-gated.
+
+It creates a confidential client, `ppe-dpop-live`, that requires `DPoP`-bound
+tokens in the given realm, and deletes it afterwards. Keycloak 26.4 and later
+support `DPoP` by default. Against a disposable Keycloak:
+
+```console
+docker run -d --rm --name ppe-keycloak -p 127.0.0.1:8080:8080 \
+  -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+  quay.io/keycloak/keycloak:26.8.0 start-dev
+until curl -sf http://127.0.0.1:8080/realms/master >/dev/null; do sleep 2; done
+DPOP_LIVE_KEYCLOAK_URL=http://127.0.0.1:8080 DPOP_LIVE_REALM=master \
+  DPOP_LIVE_ADMIN_USER=admin DPOP_LIVE_ADMIN_PASSWORD=admin \
+  cargo test -p praxis-policy --all-features --test dpop_live -- --ignored --nocapture
+docker stop ppe-keycloak
+```
+
+The test fails if Keycloak refuses the proof, if the token's `cnf.jkt` differs
+from the thumbprint PPE computes for the same key, or if the resolver accepts
+the token without recording the binding.
 
 ## Integration suites
 
@@ -214,6 +258,7 @@ when its variables are unset, so `--include-ignored` stays green.
 | `PPE_KEYCLOAK_URL` | Scenarios 01 to 06 and 12 against the `policy-demo` realm |
 | `PPE_CIBA_AUTO_APPROVE` | With `PPE_KEYCLOAK_URL`, scenario 11 through a CIBA channel that approves on its own |
 | `VAULT_ADDR`, `VAULT_ROLE_ID`, `VAULT_SECRET_ID` | The secret assertion read from Vault `secret/hr-mcp#api_key` |
+| `VALKEY_TEST_URL` with `PPE_KEYCLOAK_URL` and `PPE_CIBA_AUTO_APPROVE` | Scenario 11 across two hosts sharing a Valkey CIBA store |
 
 Live personas get real tokens from the realm: a password grant for `bob`,
 `eve` and `alice`, `client_credentials` for `hr-copilot`. Keycloak ignores
@@ -235,6 +280,25 @@ PPE_KEYCLOAK_URL=http://localhost:8081 VALKEY_TEST_URL=redis://127.0.0.1:6379 \
   cargo test --all-features -p praxis-policy-tests-integration \
   -- --ignored --nocapture scenarios::live::
 docker stop ppe-keycloak ppe-valkey
+```
+
+To test the ACL users in
+[Elicitation](apl/elicitation.md#shared-server-separate-acl-user), start a
+Valkey server and run the ignored `documented_acl_users` test. Set
+`PPE_ACL_VALKEY` to its address and provide both passwords:
+
+```console
+docker run -d --rm --name ppe-acl-valkey -p 127.0.0.1:6380:6379 valkey/valkey:8.1.10
+docker exec ppe-acl-valkey valkey-cli ACL SETUSER ppe-taint reset on '>taint-pw' \
+  '~taint:v1:*' resetchannels +sadd +smembers +expire +multi +exec +ping +unwatch '+client|setinfo'
+docker exec ppe-acl-valkey valkey-cli ACL SETUSER ppe-ciba reset on '>ciba-pw' \
+  '~ciba:v1:*' resetchannels +hmset +hgetall +hset +pexpire +del +exists \
+  +hget +hexists +hdel +time +multi +exec +evalsha '+script|load' \
+  +ping +unwatch '+client|setinfo'
+PPE_ACL_VALKEY=127.0.0.1:6380 PPE_TAINT_PW=taint-pw PPE_CIBA_PW=ciba-pw \
+  cargo nextest run -p praxis-policy-builtins --all-features --test valkey \
+  --run-ignored only -E 'test(documented_acl_users)'
+docker stop ppe-acl-valkey
 ```
 
 For Vault, provision a dev server as in the section above, with the policy

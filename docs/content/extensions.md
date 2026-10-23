@@ -118,6 +118,8 @@ plugins:
       - read_subject
       - read_client
       - read_delegation
+    config:
+      destination: stderr
 ```
 
 ### Read capabilities and the bag keys they unlock

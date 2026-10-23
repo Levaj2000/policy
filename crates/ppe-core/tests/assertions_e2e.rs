@@ -1530,8 +1530,6 @@ routes:
         - x-api-*
 ";
 
-    /// What the issue asks for: the header reaches the upstream carrying the
-    /// declared value, and the client's own attempt at the same name is gone.
     #[tokio::test]
     async fn a_secret_is_injected_onto_the_upstream_request() {
         let fixture = Fixture::new("sk-live-abc123\n");
