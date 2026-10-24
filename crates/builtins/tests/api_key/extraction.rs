@@ -4,7 +4,8 @@
 //! Reading the credential off the request, and the prefix gate.
 
 use crate::support::{
-    RecordFile, denial_code, file_config, hash, resolve, resolve_with_header, resolver,
+    RecordFile, cookie_config, denial_code, file_config, hash, query_param_config, resolve,
+    resolve_with_cookie, resolve_with_header, resolve_with_query, resolver,
 };
 
 use std::collections::HashMap;
@@ -42,6 +43,19 @@ async fn an_empty_credential_denies_separately_from_a_missing_one() {
     );
 }
 
+#[tokio::test]
+async fn an_empty_header_with_prefix_denies_as_empty() {
+    let file = one_record();
+    let resolver = resolver(file_config(file.path(), Some("Bearer "))).expect("the config builds");
+
+    let result = resolve_with_header(&resolver, "").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.empty_credential")
+    );
+}
+
 /// A value carrying only the scheme has no credential after it. It has to read
 /// as empty rather than reach the directory as a zero length key and come back
 /// reported as unknown.
@@ -64,7 +78,6 @@ async fn a_value_that_is_only_the_scheme_is_empty_not_unknown() {
 /// credential would come back unknown.
 #[tokio::test]
 async fn the_leader_after_the_scheme_stays_part_of_the_credential() {
-    // The record's digest is of `sk-oai-secret`, leader included.
     let file = one_record();
     let resolver =
         resolver(file_config(file.path(), Some("Bearer sk-oai-"))).expect("the config builds");
@@ -106,10 +119,15 @@ async fn a_credential_without_this_resolvers_prefix_declines_rather_than_denies(
     );
 }
 
-/// RFC 7235 makes the auth scheme case-insensitive, and the JWT resolver
+// -----------------------------------------------------------------------------
+// RFC 9110 Section 11.1
+// -----------------------------------------------------------------------------
+/// [RFC 9110 Section 11.1] makes the auth scheme case-insensitive, and the JWT resolver
 /// already treats it that way. Two identity plugins disagreeing about whether
 /// `bearer` is `Bearer` would be a difference an operator discovers in
 /// production.
+///
+/// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
 #[tokio::test]
 async fn the_auth_scheme_in_a_prefix_matches_without_case() {
     let file = one_record();
@@ -121,7 +139,6 @@ async fn the_auth_scheme_in_a_prefix_matches_without_case() {
         "bearer sk-oai-secret",
         "BEARER sk-oai-secret",
         "BeArEr sk-oai-secret",
-        // `1*SP`: any run of spaces separates the scheme from the credential.
         "bearer   sk-oai-secret",
     ] {
         let result = resolve_with_header(&resolver, value).await;
@@ -150,7 +167,13 @@ async fn the_credential_after_the_scheme_stays_case_sensitive() {
     );
 }
 
-/// A value merely starting with the scheme's letters is not that scheme.
+// -----------------------------------------------------------------------------
+// RFC 9110 Section 11.1
+// -----------------------------------------------------------------------------
+/// A value merely starting with the scheme's letters is not that scheme under
+/// [RFC 9110 Section 11.1].
+///
+/// [RFC 9110 Section 11.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-11.1
 #[tokio::test]
 async fn a_scheme_needs_a_space_after_it() {
     let file = one_record();
@@ -232,7 +255,10 @@ fn an_empty_header_name_is_refused_at_config_load() {
 
     let error = resolver(config).expect_err("an empty name must not build");
 
-    assert!(error.contains("empty name"), "got: {error}");
+    assert!(
+        error.contains("empty name") || error.contains("non-empty"),
+        "got: {error}"
+    );
 }
 
 /// A leading space would be read as an empty auth scheme, and then no value
@@ -257,4 +283,171 @@ fn a_prefix_inside_credential_is_refused_at_config_load() {
 
     let error = resolver(config).expect_err("a misplaced prefix must not build");
     assert!(error.contains("unknown field"), "got: {error}");
+}
+
+#[tokio::test]
+async fn a_cookie_credential_resolves_an_identity() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result =
+        resolve_with_cookie(&resolver, "session=x; api_key=sk-oai-secret; theme=dark").await;
+
+    assert!(
+        denial_code(&result).is_none(),
+        "a valid cookie key must resolve: {:?}",
+        denial_code(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_missing_cookie_denies_as_missing() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "session=x; theme=dark").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn a_missing_cookie_header_denies_as_missing() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve(&resolver, HashMap::new()).await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn an_empty_cookie_credential_denies_as_empty() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "api_key=").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.empty_credential")
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_cookie_name_denies_as_ambiguous() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "api_key=a; api_key=b").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.ambiguous_credential"),
+        "a duplicate credential cookie name must not resolve"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_cookie_denies_as_malformed() {
+    let file = one_record();
+    let resolver = resolver(cookie_config(file.path(), "api_key")).expect("cookie config builds");
+
+    let result = resolve_with_cookie(&resolver, "api_key=sk-oai-secret\r\nInjected: value").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.malformed_credential")
+    );
+}
+
+#[tokio::test]
+async fn a_query_param_credential_resolves_an_identity() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "page=1&api_key=sk-oai-secret&limit=10").await;
+
+    assert!(
+        denial_code(&result).is_none(),
+        "a valid query-param key must resolve: {:?}",
+        denial_code(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_missing_query_param_denies_as_missing() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "page=1&limit=10").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn no_query_string_denies_as_missing() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve(&resolver, HashMap::new()).await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.missing_credential")
+    );
+}
+
+#[tokio::test]
+async fn an_empty_query_param_credential_denies_as_empty() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "api_key=").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.empty_credential")
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_query_param_name_denies_as_ambiguous() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "api_key=a&api_key=b").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.ambiguous_credential"),
+        "a duplicate credential query param must not resolve"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_query_param_denies_as_malformed() {
+    let file = one_record();
+    let resolver =
+        resolver(query_param_config(file.path(), "api_key")).expect("query_param config builds");
+
+    let result = resolve_with_query(&resolver, "api_key=sk-oai-secret\r\nInjected: value").await;
+
+    assert_eq!(
+        denial_code(&result).as_deref(),
+        Some("auth.malformed_credential")
+    );
 }

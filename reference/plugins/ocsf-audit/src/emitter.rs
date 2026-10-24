@@ -96,6 +96,11 @@ pub struct OcsfAuditEmitter {
 }
 
 const MAX_PENDING_WRITES: usize = 4;
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_PENDING_WRITES is a small compile-time constant"
+)]
+const MAX_PENDING_WRITES_U32: u32 = MAX_PENDING_WRITES as u32;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `fingerprint` object around a hex digest.
@@ -465,8 +470,11 @@ impl OcsfAuditEmitter {
     async fn drain_and_flush(&self, grace: Duration) -> Result<(), Box<PluginError>> {
         // The semaphore has four permits. Taking all four waits for every
         // blocking worker, including those detached by an audit timeout.
-        let drained =
-            tokio::time::timeout(grace, Arc::clone(&self.output_slots).acquire_many_owned(4)).await;
+        let drained = tokio::time::timeout(
+            grace,
+            Arc::clone(&self.output_slots).acquire_many_owned(MAX_PENDING_WRITES_U32),
+        )
+        .await;
         let drain_guard = match drained {
             Ok(Ok(permit)) => Some(permit),
             Ok(Err(err)) => {
@@ -2257,6 +2265,63 @@ mod tests {
         shutdown.await.unwrap().unwrap();
         assert_eq!(capture.records.lock().unwrap().len(), 1);
         assert_eq!(capture.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_all_in_flight_writes_before_flushing() {
+        let (blocking, entered, release) = blocking_exporter();
+        let capture = Arc::new(Capture::default());
+        let mut emitter = OcsfAuditEmitter::new(sink_cfg(json!({}))).unwrap();
+        emitter.exporters = vec![blocking, capture.clone()];
+        let emitter = Arc::new(emitter);
+
+        let mut handles = Vec::new();
+        for i in 0..MAX_PENDING_WRITES {
+            let permit = emitter.output_slot().await.unwrap();
+            let emitter = Arc::clone(&emitter);
+            handles.push(tokio::spawn(async move {
+                emitter
+                    .emit(
+                        json!({ "metadata": { "uid": format!("record-{i}") } }),
+                        None,
+                        permit,
+                    )
+                    .await;
+            }));
+        }
+
+        entered.await.unwrap();
+        let mut drain = {
+            let emitter = Arc::clone(&emitter);
+            tokio::spawn(async move { emitter.drain_and_flush(Duration::from_secs(5)).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "drain must wait while a write is in flight"
+        );
+        assert_eq!(capture.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        for _ in 0..MAX_PENDING_WRITES {
+            release.send(()).unwrap();
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        drain.await.unwrap().unwrap();
+
+        let records = capture.records.lock().unwrap();
+        assert_eq!(
+            records.len(),
+            MAX_PENDING_WRITES,
+            "all in-flight writes must complete before drain returns"
+        );
+        assert_eq!(
+            capture.flushes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "flush must run exactly once after drain"
+        );
     }
 
     #[tokio::test]

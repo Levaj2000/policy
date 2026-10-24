@@ -13,7 +13,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use praxis_policy_core::context::PluginContext;
 use praxis_policy_core::error::{PluginError, PluginViolation};
-use praxis_policy_core::extensions::raw_credentials::TokenRole;
+use praxis_policy_core::extensions::raw_credentials::{Credential, TokenRole};
 use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
 use praxis_policy_core::identity::mapping::{ClaimMapper as _, ConfiguredClaimMap};
@@ -24,8 +24,8 @@ use crate::plugins::identity_api_key::cache::CachingDirectory;
 use crate::plugins::identity_api_key::config::{
     ApiKeyResolverConfig, ExpiryPolicy, ProviderConfig,
 };
-use crate::plugins::identity_api_key::credential::{CredentialLocation, Extraction};
-use crate::plugins::identity_api_key::directory::KeyDirectory;
+use crate::plugins::identity_api_key::credential::{CredentialLocation, ExtractionError};
+use crate::plugins::identity_api_key::directory::{KeyDirectory, PresentedKey};
 use crate::plugins::identity_api_key::file_directory::FileDirectory;
 use crate::plugins::identity_api_key::http_directory::HttpDirectory;
 
@@ -46,6 +46,10 @@ pub mod codes {
     pub const MISSING_CREDENTIAL: &str = "auth.missing_credential";
     /// The location held a value and it was empty.
     pub const EMPTY_CREDENTIAL: &str = "auth.empty_credential";
+    /// The credential name appeared more than once.
+    pub const AMBIGUOUS_CREDENTIAL: &str = "auth.ambiguous_credential";
+    /// The credential input is structurally malformed.
+    pub const MALFORMED_CREDENTIAL: &str = "auth.malformed_credential";
     /// The directory answered, and no record matched.
     pub const KEY_UNKNOWN: &str = "auth.key_unknown";
     /// A record matched and has expired.
@@ -99,6 +103,18 @@ impl ApiKeyIdentityResolver {
             message: format!("{}: {e}", config.name),
         })?;
 
+        let location = settings.location();
+        if matches!(location.credential, Credential::QueryParam { .. })
+            && !config.capabilities.contains("read_query")
+        {
+            return Err(Box::new(PluginError::Config {
+                message: format!(
+                    "{}: `credential.kind: query_param` needs the `read_query` capability",
+                    config.name
+                ),
+            }));
+        }
+
         let directory: Arc<dyn KeyDirectory> = match &settings.provider {
             ProviderConfig::File(file) => Arc::new(FileDirectory::new(file.clone()).map_err(
                 |e| PluginError::Config {
@@ -123,7 +139,6 @@ impl ApiKeyIdentityResolver {
             None => directory,
         };
 
-        let location = settings.location();
         Ok(Self {
             config,
             settings,
@@ -150,26 +165,15 @@ impl HookHandler<IdentityHook> for ApiKeyIdentityResolver {
     ) -> PluginResult<IdentityPayload> {
         let location = &self.location;
 
-        let presented = match location.extract(payload.headers()) {
-            Extraction::Found => match location.presented(payload.headers()) {
-                Some(key) => key,
-                // `extract` said Found, so this is unreachable. Denying rather
-                // than unwrapping keeps a future divergence between the two a
-                // rejected request instead of a panicked worker.
-                None => {
-                    return PluginResult::deny(PluginViolation::new(
-                        codes::MISSING_CREDENTIAL,
-                        format!("no credential at {}", location.credential),
-                    ));
-                },
-            },
-            Extraction::Missing => {
+        let presented = match location.raw_from_ext(payload.headers(), ext) {
+            Ok(key) => PresentedKey::new(key.into_bytes()),
+            Err(ExtractionError::Missing) => {
                 return PluginResult::deny(PluginViolation::new(
                     codes::MISSING_CREDENTIAL,
                     format!("no credential at {}", location.credential),
                 ));
             },
-            Extraction::Empty => {
+            Err(ExtractionError::Empty) => {
                 return PluginResult::deny(PluginViolation::new(
                     codes::EMPTY_CREDENTIAL,
                     format!("{} holds an empty credential", location.credential),
@@ -178,10 +182,28 @@ impl HookHandler<IdentityHook> for ApiKeyIdentityResolver {
             // Another resolver's key population. Carry the decline to the
             // executor while leaving identity slots untouched for whoever
             // services it; denying here would make two populations impossible.
-            Extraction::WrongPrefix => {
+            Err(ExtractionError::WrongPrefix) => {
                 let mut updated = payload.clone();
                 updated.mark_credential_declined();
                 return PluginResult::modify_payload(updated);
+            },
+            Err(ExtractionError::Ambiguous) => {
+                return PluginResult::deny(PluginViolation::new(
+                    codes::AMBIGUOUS_CREDENTIAL,
+                    format!("ambiguous credential at {}", location.credential),
+                ));
+            },
+            Err(ExtractionError::Malformed) => {
+                return PluginResult::deny(PluginViolation::new(
+                    codes::MALFORMED_CREDENTIAL,
+                    format!("malformed credential at {}", location.credential),
+                ));
+            },
+            Err(_) => {
+                return PluginResult::deny(PluginViolation::new(
+                    codes::MISSING_CREDENTIAL,
+                    format!("unexpected extraction outcome at {}", location.credential),
+                ));
             },
         };
 
