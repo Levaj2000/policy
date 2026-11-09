@@ -10,12 +10,17 @@
 //! commit [`PRAXIS_COMMIT`], the files listed in [`MIRRORED`]:
 //!
 //! - `filter.rs`: `PolicyFilter::new` (builtins, host factories, transport,
-//!   load, initialize, `parse_config` for the assertions contract),
-//!   `identity_gate` (`on_request`), `on_request_body`,
-//!   `extensions_from_identity`, `attach_http_attributes`,
-//!   `attach_delegated_tokens`, `on_response`, `on_response_body`.
+//!   load, initialize, `parse_config` for the assertions contract, the
+//!   rate-limit stages a registered plugin enables), `identity_gate`
+//!   (`on_request`), `pre_identity_limit`, `post_identity_limit`,
+//!   `on_request_body`, `extensions_from_identity`, `attach_delegated_tokens`,
+//!   `response_extensions`, `on_response`, `on_response_body`.
 //! - `assertions.rs`: `GovernedNames` and the govern-then-diff application of
 //!   rendered headers, in both directions.
+//! - `request_headers.rs`: the request header queue, where a later set or
+//!   removal of a name replaces any earlier queued set of it.
+//! - `request_facts.rs`: the request view each hook is shown, carrying the
+//!   `secret_headers` of the applied request assertions.
 //! - `json_rpc.rs`: the tool-call content parts and both body rewrites.
 //! - `common_message_format.rs`: `tools/call` to the tool hooks.
 //! - `error.rs`: what a deny carries (code, reason, `proto_error_code`,
@@ -31,27 +36,36 @@
 //! 2. Body phase: identity again at the tool's coordinates, then
 //!    `ratelimit.post_identity` there with the resolved identity, then
 //!    `cmf.tool_pre_invoke` with identity, meta, HTTP attributes and the
-//!    `X-Session-Id` session. On allow: delegated tokens, then request
-//!    assertions, then the rewritten arguments into the body.
+//!    `X-Session-Id` session. On allow: delegated tokens, refused with
+//!    `policy.unstrippable_credential` while an inbound credential sits where
+//!    it cannot be stripped, then request assertions, then the rewritten
+//!    arguments into the body.
 //! 3. The [`Upstream`] stand-in answers.
 //! 4. Response headers: `http.response` and response assertions, when the
-//!    policy has either.
+//!    policy has either, on the inbound request view plus the response
+//!    headers and status.
 //! 5. Response body: `cmf.tool_post_invoke` on the result, then the
 //!    rewritten result into the body.
+//!
+//! Each rate-limit hook runs once per call, only when a plugin is registered
+//! on it, and one context table threads through every hook of the call. Both
+//! response hooks see the `secret_headers` of the applied request assertions,
+//! as `docs/content/assertions.md` requires.
 //!
 //! The driver assumes `body_access: read_write` and a `tools/call` request
 //! the classifier already attributed, as in the demo.
 //!
 //! # Not mirrored
 //!
-//! - The praxis commit above calls neither rate-limit hook. This driver calls
-//!   each once per call, when a plugin is registered on it, as the host
-//!   contract requires, and threads one context table through every hook of
-//!   the call so the engine can tell the pre-identity stage ran.
-//! - Praxis supplies no HTTP extension to `cmf.tool_post_invoke`. This driver
-//!   carries the pre-invoke view, including `secret_headers`, as required by
-//!   `docs/content/assertions.md`. Both hosts rebuild the `http.response`
-//!   view from inbound headers plus response headers and status.
+//! - Praxis maps a limiter deny to its wire form: a status from 400, 401, 429
+//!   and 503, fixed text per code, and only `limit`, `remaining`,
+//!   `retry_after_seconds` and `window_seconds` from its details. This driver
+//!   returns the engine's violation unmapped.
+//! - Praxis shows `cmf.tool_post_invoke` the request as first captured, with
+//!   the `secret_headers` of the applied request assertions but without the
+//!   headers they rendered, so a later plugin never sees a secret-sourced
+//!   header. This driver carries the pre-invoke hook's rendered view, so the
+//!   later plugin sees its marker, as `docs/content/assertions.md` requires.
 //! - Praxis bounds the synchronous CMF response-body hook on `dispatch.rs`'s
 //!   two-worker runtime by `max(2 * plugin_timeout, 1s)`. This driver awaits
 //!   it directly. Both hosts await `http.response` directly.
@@ -66,9 +80,13 @@
 //! - Content-Length fitting of a rewritten response, and the
 //!   `gateway.response_rewrite_overflow` deny when a rewrite grows;
 //! - JSON-RPC parsing of an invalid body, and classifier metadata;
+//! - failing closed on a classified `tools/call` response that is neither an
+//!   inspectable result nor a valid JSON-RPC error;
 //! - body size ceilings;
 //! - comma-joining duplicate header lines, and header name and value
-//!   validity on the wire;
+//!   validity on the wire, with the `policy.delegation_failed` deny when no
+//!   delegated token forms a valid header;
+//! - the `context_headers` and `context_meta` filter settings;
 //! - policy validation for `result:` field rules on `prompt:` and
 //!   `resource:` routes. Praxis rejects these rules; this driver accepts them.
 //!
@@ -122,12 +140,14 @@ use crate::upstream::{Upstream, UpstreamRequest};
 /// The praxis commit used to verify the files in [`MIRRORED`].
 ///
 /// [`MIRRORED`]: MIRRORED
-pub const PRAXIS_COMMIT: &str = "dccc6b735cce2de30c00fdf4992e0d27422cd8b5";
+pub const PRAXIS_COMMIT: &str = "c3d2ae3628cf3167780e58c5e8b38580d0241399";
 
 /// The praxis files this driver mirrors, relative to the praxis root.
-pub const MIRRORED: [&str; 6] = [
+pub const MIRRORED: [&str; 8] = [
     "crates/filter/src/builtins/http/security/policy/filter.rs",
     "crates/filter/src/builtins/http/security/policy/assertions.rs",
+    "crates/filter/src/builtins/http/security/policy/request_headers.rs",
+    "crates/filter/src/builtins/http/security/policy/request_facts.rs",
     "crates/filter/src/builtins/http/security/policy/json_rpc.rs",
     "crates/filter/src/builtins/http/security/policy/common_message_format.rs",
     "crates/filter/src/builtins/http/security/policy/error.rs",
@@ -136,6 +156,10 @@ pub const MIRRORED: [&str; 6] = [
 
 /// `kind:` of the header probe a fixture may declare.
 const PROBE_KIND: &str = "test/header-probe";
+
+/// The violation praxis denies with when a delegated token would travel
+/// beside an inbound credential it cannot strip.
+pub const UNSTRIPPABLE_CREDENTIAL: &str = "policy.unstrippable_credential";
 
 /// An engine with every builtin, the APL visitor and the reference plugins,
 /// registered piece by piece as a host does.
@@ -298,7 +322,8 @@ impl GovernedNames {
     }
 }
 
-/// The request mutations praxis queues, applied remove then set.
+/// The request mutations praxis queues, applied remove then set. A later
+/// write to a name replaces any earlier queued set of it (`request_headers.rs`).
 #[derive(Debug, Default)]
 struct Queued {
     set: Vec<(String, String)>,
@@ -310,6 +335,16 @@ impl Queued {
         let before = self.set.len();
         self.set.retain(|(name, _)| name != lowercase);
         self.set.len() != before
+    }
+
+    fn queue_remove(&mut self, lowercase: String) {
+        self.purge(&lowercase);
+        self.remove.push(lowercase);
+    }
+
+    fn queue_set(&mut self, lowercase: String, value: String) {
+        self.purge(&lowercase);
+        self.set.push((lowercase, value));
     }
 
     fn forwarded(&self, inbound: &HashMap<String, String>) -> HashMap<String, String> {
@@ -351,20 +386,20 @@ fn apply_request_assertions(
         for name in governed.candidates(in_play.iter().map(String::as_str)) {
             let had_pending = queued.purge(&name);
             if let Some(value) = rendered.get(&name) {
-                queued.set.push((name, value.clone()));
+                queued.queue_set(name, value.clone());
             } else if inbound.contains_key(&name) || had_pending {
-                queued.remove.push(name);
+                queued.queue_remove(name);
             }
         }
     }
     for (name, value) in &rendered {
         if !governed.governs(name) && inbound.get(name) != Some(value) {
-            queued.set.push((name.clone(), value.clone()));
+            queued.queue_set(name.clone(), value.clone());
         }
     }
     for name in inbound.keys() {
         if !governed.governs(name) && !rendered.contains_key(name) {
-            queued.remove.push(name.clone());
+            queued.queue_remove(name.clone());
         }
     }
 }
@@ -410,12 +445,30 @@ fn apply_response_assertions(
     }
 }
 
+/// `request_view` after the request assertions: the inbound view, carrying
+/// the `secret_headers` the asserting hook rendered, for the response hooks.
+fn asserted_view(inbound: &HttpExtension, extensions: Option<&Extensions>) -> HttpExtension {
+    let mut view = inbound.clone();
+    if let Some(asserted) = extensions.and_then(|e| e.http.as_deref()) {
+        view.secret_headers = asserted.secret_headers.clone();
+    }
+    view
+}
+
 /// `attach_delegated_tokens`: one delegated value per outbound name, first
 /// audience wins, and the inbound credential headers removed once any is
 /// attached. Each token carries its own prefix (`Bearer `, `token `, or bare).
-fn attach_delegated_tokens(queued: &mut Queued, extensions: Option<&Extensions>) -> usize {
+///
+/// # Errors
+///
+/// The [`UNSTRIPPABLE_CREDENTIAL`] violation, attaching nothing, when a
+/// token would travel beside an inbound credential no header carries.
+fn attach_delegated_tokens(
+    queued: &mut Queued,
+    extensions: Option<&Extensions>,
+) -> Result<usize, Box<PluginViolation>> {
     let Some(raw) = extensions.and_then(|e| e.raw_credentials.as_deref()) else {
-        return 0;
+        return Ok(0);
     };
     let mut tokens: Vec<_> = raw.delegated_tokens.values().collect();
     tokens.sort_by(|a, b| {
@@ -424,44 +477,54 @@ fn attach_delegated_tokens(queued: &mut Queued, extensions: Option<&Extensions>)
             .cmp(&b.outbound_header.to_ascii_lowercase())
             .then_with(|| a.audience.cmp(&b.audience))
     });
-    let mut attached = HashSet::new();
+    let mut outbound: Vec<(String, String)> = Vec::new();
     for token in tokens {
         let name = token.outbound_header.to_ascii_lowercase();
-        if attached.insert(name.clone()) {
-            queued.set.push((
+        if outbound.iter().all(|(attached, _)| *attached != name) {
+            outbound.push((
                 name,
                 format!("{}{}", token.outbound_prefix, token.token.as_str()),
             ));
         }
     }
-    if !attached.is_empty() {
-        for inbound in raw.inbound_tokens.values() {
-            match &inbound.source {
-                Credential::Header { name } => {
-                    let lower = name.to_ascii_lowercase();
-                    if !attached.contains(&lower) {
-                        queued.remove.push(lower);
-                    }
-                },
-                Credential::Cookie { .. } => {
-                    // Strip the entire Cookie header. Consistent with
-                    // the header path (which strips the whole
-                    // Authorization header, not just the bearer token).
-                    // The upstream gets a delegated identity, so the
-                    // user's original cookies should not be forwarded.
-                    if !queued.remove.contains(&"cookie".to_owned()) {
-                        queued.remove.push("cookie".to_owned());
-                    }
-                },
-                Credential::QueryParam { .. } => {
-                    // Query-param credentials live in the URL, not a
-                    // header — stripping requires host cooperation.
-                },
-                _ => {},
-            }
+    if outbound.is_empty() {
+        return Ok(0);
+    }
+    if raw
+        .inbound_tokens
+        .values()
+        .any(|inbound| inbound_source_header(&inbound.source).is_none())
+    {
+        return Err(Box::new(PluginViolation::new(
+            UNSTRIPPABLE_CREDENTIAL,
+            "a delegated token cannot be forwarded while the inbound credential sits in a \
+             location the filter cannot strip from the upstream request",
+        )));
+    }
+    let count = outbound.len();
+    let attached: HashSet<String> = outbound.iter().map(|(name, _)| name.clone()).collect();
+    for (name, value) in outbound {
+        queued.queue_set(name, value);
+    }
+    for inbound in raw.inbound_tokens.values() {
+        if let Some(header) = inbound_source_header(&inbound.source).map(str::to_ascii_lowercase)
+            && !attached.contains(&header)
+        {
+            queued.queue_remove(header);
         }
     }
-    attached.len()
+    Ok(count)
+}
+
+/// `inbound_source_header`: the header carrying an inbound credential. The
+/// whole `Cookie` header goes, as the whole `Authorization` header does. A
+/// query parameter lives in the URL, which the filter cannot rewrite.
+fn inbound_source_header(source: &Credential) -> Option<&str> {
+    match source {
+        Credential::Header { name } => Some(name),
+        Credential::Cookie { .. } => Some("cookie"),
+        _ => None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -678,7 +741,8 @@ pub enum Stage {
     Identity,
     /// `ratelimit.post_identity`, after identity. No CMF hook ran.
     PostIdentityRateLimit,
-    /// `cmf.tool_pre_invoke`. The upstream was not called.
+    /// `cmf.tool_pre_invoke`, or the delegation it allowed. The upstream was
+    /// not called.
     Request,
     /// The response phase. The upstream was called.
     Response,
@@ -1160,7 +1224,11 @@ impl RefHost {
         }
 
         let mut queued = Queued::default();
-        attach_delegated_tokens(&mut queued, pre.modified_extensions.as_ref());
+        if let Err(violation) =
+            attach_delegated_tokens(&mut queued, pre.modified_extensions.as_ref())
+        {
+            return deny(outcome, Stage::Request, Some(*violation), trace);
+        }
         apply_request_assertions(
             &mut queued,
             &inbound,
@@ -1171,6 +1239,7 @@ impl RefHost {
             Some(message) => rewrite_request(body, message),
             None => body,
         };
+        let view = Arc::new(asserted_view(&http, pre.modified_extensions.as_ref()));
 
         // The upstream.
         let forwarded = queued.forwarded(&inbound);
@@ -1182,12 +1251,11 @@ impl RefHost {
         // Response headers.
         if self.response_hook {
             let mut ext = identity_ext.clone();
-            ext.meta = Some(Arc::new(MetaExtension {
-                entity_type: Some(ENTITY_HTTP.to_owned()),
-                entity_name: Some(ENTITY_NAME_GLOBAL.to_owned()),
-                ..Default::default()
-            }));
-            let mut http = http.clone();
+            let mut meta = ext.meta.as_deref().cloned().unwrap_or_default();
+            meta.entity_type = Some(ENTITY_HTTP.to_owned());
+            meta.entity_name = Some(ENTITY_NAME_GLOBAL.to_owned());
+            ext.meta = Some(Arc::new(meta));
+            let mut http = (*view).clone();
             http.response_headers = outcome.response_headers.clone().into_iter().collect();
             http.status = Some(200);
             ext.http = Some(Arc::new(http));
@@ -1214,13 +1282,11 @@ impl RefHost {
             return outcome;
         };
         let mut post_ext = identity_ext;
-        if let Some(http) = pre
+        post_ext.http = pre
             .modified_extensions
             .as_ref()
             .and_then(|e| e.http.clone())
-        {
-            post_ext.http = Some(http);
-        }
+            .or(Some(view));
         let (post, bg) = self
             .engine
             .invoke_named::<CmfHook>(
@@ -1271,7 +1337,10 @@ mod tests {
             ..Default::default()
         };
         let mut queued = Queued::default();
-        assert_eq!(attach_delegated_tokens(&mut queued, Some(&extensions)), 1);
+        assert_eq!(
+            attach_delegated_tokens(&mut queued, Some(&extensions)),
+            Ok(1)
+        );
         queued.set
     }
 
@@ -1293,6 +1362,67 @@ mod tests {
 
     #[test]
     fn cookie_credential_strips_entire_cookie_header() {
+        let extensions = delegating_with_inbound(Credential::Cookie {
+            name: "__Host-jwt".into(),
+        });
+        let mut queued = Queued::default();
+        assert_eq!(
+            attach_delegated_tokens(&mut queued, Some(&extensions)),
+            Ok(1),
+            "the delegated token is attached"
+        );
+        assert!(
+            queued.remove.contains(&"cookie".to_owned()),
+            "cookie header should be queued for removal: {:?}",
+            queued.remove
+        );
+    }
+
+    #[test]
+    fn query_param_credential_refuses_delegation_and_attaches_nothing() {
+        let extensions = delegating_with_inbound(Credential::QueryParam {
+            name: "access_token".into(),
+        });
+        let mut queued = Queued::default();
+        let refused = attach_delegated_tokens(&mut queued, Some(&extensions));
+        assert_eq!(
+            refused.map_err(|v| v.code),
+            Err(UNSTRIPPABLE_CREDENTIAL.to_owned()),
+            "a credential in the URL would reach the upstream beside the delegated one"
+        );
+        assert!(
+            queued.set.is_empty() && queued.remove.is_empty(),
+            "a refused delegation queues nothing: {queued:?}"
+        );
+    }
+
+    #[test]
+    fn a_later_removal_replaces_an_earlier_queued_set() {
+        let mut queued = Queued::default();
+        queued.queue_set("authorization".to_owned(), "Bearer delegated".to_owned());
+        queued.queue_remove("authorization".to_owned());
+        let inbound = HashMap::from([("authorization".to_owned(), "Bearer inbound".to_owned())]);
+        assert_eq!(
+            queued.forwarded(&inbound).get("authorization"),
+            None,
+            "the removal queued last wins"
+        );
+        queued.queue_set("authorization".to_owned(), "Bearer asserted".to_owned());
+        assert_eq!(
+            queued
+                .forwarded(&inbound)
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer asserted"),
+            "a set queued after the removal wins"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    fn delegating_with_inbound(source: Credential) -> Extensions {
         let mut raw = RawCredentialsExtension::default();
         raw.delegated_tokens.insert(
             DelegationKey::new(DelegationMode::OnBehalfOfUser, "api", Vec::new()),
@@ -1306,24 +1436,11 @@ mod tests {
         );
         raw.inbound_tokens.insert(
             praxis_policy_core::extensions::raw_credentials::TokenRole::User,
-            RawInboundToken::new(
-                "user-jwt",
-                Credential::Cookie {
-                    name: "__Host-jwt".into(),
-                },
-                TokenKind::Jwt,
-            ),
+            RawInboundToken::new("user-jwt", source, TokenKind::Jwt),
         );
-        let extensions = Extensions {
+        Extensions {
             raw_credentials: Some(Arc::new(raw)),
             ..Default::default()
-        };
-        let mut queued = Queued::default();
-        attach_delegated_tokens(&mut queued, Some(&extensions));
-        assert!(
-            queued.remove.contains(&"cookie".to_owned()),
-            "cookie header should be queued for removal: {:?}",
-            queued.remove
-        );
+        }
     }
 }
